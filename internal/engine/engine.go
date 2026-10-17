@@ -110,6 +110,10 @@ type Peer struct {
 	lastRx       time.Duration
 	lastProgress time.Duration
 	sawPeer      bool
+	// firstRx is when the first authentic packet arrived. A PING sealed
+	// before it may have waited in a pre-pin queue or a relay hold, so
+	// its PONG is not a path RTT sample.
+	firstRx time.Duration
 
 	seq        uint64
 	srtt       time.Duration
@@ -127,6 +131,7 @@ type Peer struct {
 	extraPing  bool
 	probe      uint64
 	rxPingSent bool
+	rxRePing   bool
 
 	nextNew        uint64
 	contig         uint64
@@ -292,6 +297,12 @@ func (p *Peer) Pump(now time.Duration) {
 		p.emitPing(now)
 		p.rxPingSent = true
 	}
+	if p.sawPeer && !p.rxRePing {
+		p.rxRePing = true
+		if p.lastPing < p.firstRx {
+			p.emitPing(now)
+		}
+	}
 	p.maybeNACK(now)
 	p.maybeFeedback(now)
 	p.maybeVerify(now)
@@ -320,6 +331,9 @@ func (p *Peer) Recv(now time.Duration, dgram []byte) {
 	if !frame.KnownType(h.Type) || !frame.FlagsOK(h.Type, h.Flags) {
 		p.abort(now, frame.ReasonProtocol)
 		return
+	}
+	if !p.sawPeer {
+		p.firstRx = now
 	}
 	p.sawPeer = true
 	p.lastRx = now
@@ -991,7 +1005,8 @@ func (p *Peer) onPong(now time.Duration, h frame.Header, pt []byte) {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
-	if uint64(now) >= echo+delay {
+	stale := !p.cfg.Sender && time.Duration(echo) < p.firstRx
+	if !stale && uint64(now) >= echo+delay {
 		p.noteRTT(now-time.Duration(echo)-time.Duration(delay), now)
 	}
 	if !p.cfg.Sender {

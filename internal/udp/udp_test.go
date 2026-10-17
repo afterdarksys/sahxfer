@@ -270,3 +270,41 @@ func TestRelayCopy(t *testing.T) {
 		}
 	}
 }
+
+// A listening receiver queues its first PING until the sender appears.
+// That PONG must not become the receiver's srtt: FEEDBACK cadence is
+// max(5 ms, srtt/4), and a 1 s stale sample once held loopback to one
+// 10*MSS window per ~250 ms (2 MB hit the grant max).
+func TestLateSenderLoopbackThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("realistic-size loopback transfer")
+	}
+	file := make([]byte, 2_000_000)
+	for i := range file {
+		file[i] = byte(i*7 + i>>11)
+	}
+	e := newEnds(t, file, uint64(len(file)))
+	lc := listen(t)
+	dc := dial(t, lc.LocalAddr())
+	defer lc.Close()
+	defer dc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- Run(ctx, Config{Peer: e.r, Conn: lc}) }()
+	time.Sleep(time.Second)
+	began := time.Now()
+	txErr := Run(ctx, Config{Peer: e.s, Conn: dc, Connected: true})
+	rxErr := <-errc
+	took := time.Since(began)
+	if txErr != nil || rxErr != nil {
+		t.Fatalf("tx=%v rx=%v after %v", txErr, rxErr, took)
+	}
+	if !bytes.Equal(e.dst.b, file) || e.commits != 1 {
+		t.Fatalf("file mismatch or commits=%d", e.commits)
+	}
+	if took > 4*time.Second {
+		t.Fatalf("2 MB on loopback took %v, want under 4s", took)
+	}
+	t.Logf("2 MB in %v", took)
+}
