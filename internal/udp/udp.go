@@ -12,7 +12,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"syscall"
 	"time"
 
@@ -29,6 +31,10 @@ import (
 // The filter must not keep the slice.
 // Progress, when set, is called with the delivered byte count on the first
 // authentic datagram and then at most once a second while it changes.
+// RcvBuf is the granted receive buffer (TuneBuffers). With Diag set, a
+// data receiver checks once a second whether the usable part of it is
+// below its arrival rate times max(RTprop, 5 ms) and calls Diag with one
+// "diag warn" line the first time it is (docs/design.md section 7.4).
 type Config struct {
 	Peer      *engine.Peer
 	Conn      *net.UDPConn
@@ -36,7 +42,21 @@ type Config struct {
 	Epoch     time.Duration
 	Filter    func([]byte) bool
 	Progress  func(delivered uint64)
+	RcvBuf    int
+	Diag      func(line string)
 }
+
+// WantBuffer is the SO_RCVBUF and SO_SNDBUF each end asks for.
+const WantBuffer = 8 << 20
+
+// rxPkt is one received datagram and its source (nil when connected).
+type rxPkt struct {
+	b    []byte
+	addr *net.UDPAddr
+}
+
+// errDeadline is a socket that could not take a deadline.
+var errDeadline = errors.New("udp: deadline")
 
 // Run reads and writes until the peer finishes, fails, or ctx is done.
 // A done context cancels the peer, sends its one ABORT best-effort, and
@@ -46,7 +66,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return code.New("internal")
 	}
 	defer cfg.Peer.Close()
-	buf := make([]byte, frame.MaxDatagram)
+	sio := newSockIO(cfg.Conn, cfg.Connected)
 	var remote *net.UDPAddr
 	var queued [][]byte
 	// The sender becomes OK when DONE checks out, then rate-limits the
@@ -55,11 +75,13 @@ func Run(ctx context.Context, cfg Config) error {
 	var authentic bool
 	var lastProg time.Time
 	var progSent uint64
+	var warned bool
+	var lastCheck time.Time
 	cancel := func() error {
 		cfg.Peer.Cancel(clock(cfg.Epoch))
 		out := cfg.Peer.Take()
 		if cfg.Connected || remote != nil {
-			_ = flush(context.Background(), cfg, remote, out)
+			_ = flush(context.Background(), sio, remote, out)
 		}
 		return ctx.Err()
 	}
@@ -87,42 +109,48 @@ func Run(ctx context.Context, cfg Config) error {
 		} else if d := wake - now; d < wait {
 			wait = d
 		}
-		if err := cfg.Conn.SetReadDeadline(time.Now().Add(wait)); err != nil {
-			if ctx.Err() != nil {
-				return cancel()
-			}
-			return code.New("io")
-		}
-		n, addr, err := cfg.Conn.ReadFromUDP(buf)
+		pkts, err := sio.read(wait)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				n = 0
+			pkts = nil
+			if errors.Is(err, errDeadline) {
+				if ctx.Err() != nil {
+					return cancel()
+				}
+				return code.New("io")
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() || errors.Is(err, os.ErrDeadlineExceeded) {
+				// No datagram before the wait ran out.
 			} else if refused(err) {
 				// An ICMP port unreachable is not authenticated. The peer's
 				// ABORT, if any, is still queued behind it.
-				n = 0
 			} else if ctx.Err() != nil {
 				return cancel()
 			} else {
 				return code.New("io")
 			}
 		}
-		if n > 0 && !cfg.Connected {
-			if addr == nil || (remote != nil && addr.String() != remote.String()) {
-				n = 0
+		for _, pk := range pkts {
+			if len(pk.b) == 0 {
+				continue
 			}
-		}
-		if n > 0 && (cfg.Filter == nil || !cfg.Filter(buf[:n])) {
+			if !cfg.Connected {
+				if pk.addr == nil || (remote != nil && pk.addr.String() != remote.String()) {
+					continue
+				}
+			}
+			if cfg.Filter != nil && cfg.Filter(pk.b) {
+				continue
+			}
 			var ok bool
 			if cfg.Connected || remote != nil {
-				ok = cfg.Peer.Recv(clock(cfg.Epoch), buf[:n])
+				ok = cfg.Peer.Recv(clock(cfg.Epoch), pk.b)
 			} else {
-				ok = cfg.Peer.RecvUnpinned(clock(cfg.Epoch), buf[:n])
+				ok = cfg.Peer.RecvUnpinned(clock(cfg.Epoch), pk.b)
 			}
 			if ok && !cfg.Connected && remote == nil {
 				// Pin only after the datagram opened under the grant key.
-				remote = copyAddr(addr)
-				if err := flush(ctx, cfg, remote, queued); err != nil {
+				remote = copyAddr(pk.addr)
+				if err := flush(ctx, sio, remote, queued); err != nil {
 					if ctx.Err() != nil {
 						return cancel()
 					}
@@ -133,12 +161,20 @@ func Run(ctx context.Context, cfg Config) error {
 			if ok && cfg.Progress != nil {
 				d := cfg.Peer.Delivered()
 				if !authentic || (d != progSent && time.Since(lastProg) >= time.Second) {
-					authentic = true
 					progSent = d
 					lastProg = time.Now()
 					cfg.Progress(d)
 				}
 			}
+			if ok {
+				authentic = true
+			}
+		}
+		if cfg.Diag != nil && !warned && authentic && cfg.RcvBuf > 0 && time.Since(lastCheck) >= time.Second {
+			if !lastCheck.IsZero() {
+				warned = checkRcvBuf(cfg, clock(cfg.Epoch))
+			}
+			lastCheck = time.Now()
 		}
 		now = clock(cfg.Epoch)
 		cfg.Peer.Pump(now)
@@ -146,7 +182,7 @@ func Run(ctx context.Context, cfg Config) error {
 		note(out)
 		if !cfg.Connected && remote == nil {
 			queued = append(queued, out...)
-		} else if err := flush(ctx, cfg, remote, out); err != nil {
+		} else if err := flush(ctx, sio, remote, out); err != nil {
 			if ctx.Err() != nil {
 				return cancel()
 			}
@@ -161,6 +197,33 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// checkRcvBuf writes one diag warn line when the data receiver's usable
+// receive buffer is short, and reports whether it did.
+func checkRcvBuf(cfg Config, now time.Duration) bool {
+	rate, rtt := cfg.Peer.RecvRate(now)
+	line, short := rcvBufWarn(cfg.RcvBuf, rate, rtt)
+	if short {
+		cfg.Diag(line)
+	}
+	return short
+}
+
+// rcvBufWarn compares the usable part of a granted receive buffer with
+// rate * max(rtt, 5 ms) (docs/design.md section 7.4).
+func rcvBufWarn(rcvbuf int, rate float64, rtt time.Duration) (string, bool) {
+	if rate <= 0 || rcvbuf <= 0 {
+		return "", false
+	}
+	if rtt < 5*time.Millisecond {
+		rtt = 5 * time.Millisecond
+	}
+	need := rate * rtt.Seconds()
+	if float64(usableRcv(rcvbuf)) >= need {
+		return "", false
+	}
+	return fmt.Sprintf("diag warn rcvbuf=%d usable=%d need=%.0f rate=%.0f rtt=%s", rcvbuf, usableRcv(rcvbuf), need, rate, rtt.Round(time.Microsecond)), true
+}
+
 func clock(epoch time.Duration) time.Duration {
 	now := time.Duration(time.Now().UnixNano())
 	if epoch == 0 {
@@ -173,26 +236,21 @@ func copyAddr(a *net.UDPAddr) *net.UDPAddr {
 	return &net.UDPAddr{IP: append(net.IP(nil), a.IP...), Port: a.Port, Zone: a.Zone}
 }
 
-func flush(ctx context.Context, cfg Config, remote *net.UDPAddr, pkts [][]byte) error {
-	for _, p := range pkts {
-		if err := ctx.Err(); err != nil {
-			return err
+func flush(ctx context.Context, sio *sockIO, remote *net.UDPAddr, pkts [][]byte) error {
+	if len(pkts) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !sio.connected && remote == nil {
+		return code.New("internal")
+	}
+	if err := sio.write(pkts, remote); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		var err error
-		if cfg.Connected {
-			_, err = cfg.Conn.Write(p)
-		} else {
-			if remote == nil {
-				return code.New("internal")
-			}
-			_, err = cfg.Conn.WriteToUDP(p, remote)
-		}
-		if err != nil && !refused(err) {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return code.New("io")
-		}
+		return code.New("io")
 	}
 	return nil
 }
