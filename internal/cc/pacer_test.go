@@ -413,11 +413,16 @@ func TestPacingNoCreditAfterIdle(t *testing.T) {
 	}
 }
 
-// RTprop can rise: PROBE_RTT ends with the least sample taken during it.
-// A route change from 100 ms to 500 ms otherwise keeps 100 ms forever.
+// RTprop can rise: PROBE_RTT ends with the least sample taken during it,
+// capped at the controller's srtt. A route change from 100 ms to 500 ms
+// otherwise keeps 100 ms forever.
 func TestRTpropRisesAfterProbeRTT(t *testing.T) {
 	p := New(1000)
 	p.OnRTT(100*time.Millisecond, 0)
+	// After the route change every sample is 500 ms; srtt follows.
+	for at := time.Second; at < 10*time.Second; at += 100 * time.Millisecond {
+		p.OnRTT(500*time.Millisecond, at)
+	}
 	p.CanSend(10*time.Second, 1000)
 	if p.State() != ProbeRTT {
 		t.Fatalf("state %s", p.State())
@@ -425,13 +430,74 @@ func TestRTpropRisesAfterProbeRTT(t *testing.T) {
 	p.OnRTT(520*time.Millisecond, 10*time.Second+50*time.Millisecond)
 	p.OnRTT(500*time.Millisecond, 10*time.Second+100*time.Millisecond)
 	p.CanSend(10*time.Second+200*time.Millisecond, 1000)
-	if p.State() != ProbeBW || p.minRTT != 500*time.Millisecond {
+	if p.State() != ProbeBW || p.minRTT < 499*time.Millisecond || p.minRTT > 500*time.Millisecond {
 		t.Fatalf("state %s RTprop %v, want 500ms", p.State(), p.minRTT)
 	}
 	// No sample during the probe: RTprop stays, its age restarts.
+	before := p.minRTT
 	p.CanSend(20*time.Second+200*time.Millisecond, 1000)
 	p.CanSend(20*time.Second+800*time.Millisecond, 1000)
-	if p.State() != ProbeBW || p.minRTT != 500*time.Millisecond {
+	if p.State() != ProbeBW || p.minRTT != before {
 		t.Fatalf("state %s RTprop %v", p.State(), p.minRTT)
+	}
+}
+
+// One probe whose samples are all outliers cannot raise RTprop past srtt.
+func TestRTpropRiseCappedAtSRTT(t *testing.T) {
+	p := New(1000)
+	for at := time.Duration(0); at < 10*time.Second; at += 100 * time.Millisecond {
+		p.OnRTT(100*time.Millisecond, at)
+	}
+	p.CanSend(20*time.Second, 1000)
+	if p.State() != ProbeRTT {
+		t.Fatalf("state %s", p.State())
+	}
+	p.OnRTT(900*time.Millisecond, 20*time.Second+50*time.Millisecond)
+	p.CanSend(20*time.Second+200*time.Millisecond, 1000)
+	if p.minRTT > p.srtt || p.minRTT >= 900*time.Millisecond {
+		t.Fatalf("RTprop %v, srtt %v: outlier probe raised it past srtt", p.minRTT, p.srtt)
+	}
+}
+
+// UndoLoss reverts a loss round: the loss, the cut, inflight_lo, bw_lo,
+// and the STARTUP that cut ended.
+func TestUndoLossRestores(t *testing.T) {
+	s := newSteps(1000)
+	snap := s.p.SaveLoss()
+	s.p.OnSend(100_000, s.now)
+	s.p.OnLoss(10_000, s.now)
+	s.step(100_000)
+	if s.p.State() != Drain || s.p.LossCuts() != 1 || s.p.inflightLo == 0 || s.p.bwLo == 0 {
+		t.Fatalf("no cut to undo: %s cuts %d", s.p.State(), s.p.LossCuts())
+	}
+	s.p.UndoLoss(10_000, snap, s.now)
+	if s.p.State() != Startup || s.p.Gain() != startupGain {
+		t.Fatalf("STARTUP not restored: %s gain %v", s.p.State(), s.p.Gain())
+	}
+	if s.p.inflightLo != 0 || s.p.bwLo != 0 || s.p.LossCuts() != 0 || s.p.Lost() != 0 {
+		t.Fatalf("inflight_lo %d bw_lo %v cuts %d lost %d", s.p.inflightLo, s.p.bwLo, s.p.LossCuts(), s.p.Lost())
+	}
+}
+
+// STARTUP that ended without a cut (bandwidth stalled) after the snapshot
+// is not restored by undoing a later cut.
+func TestUndoLossKeepsStallExit(t *testing.T) {
+	s := newSteps(1000)
+	snap := s.p.SaveLoss() // taken in STARTUP
+	for i := 0; i < 4; i++ {
+		s.step(50_000)
+	}
+	if s.p.State() == Startup || s.p.LossCuts() != 0 {
+		t.Fatalf("startup did not stall out: %s cuts %d", s.p.State(), s.p.LossCuts())
+	}
+	s.p.OnSend(50_000, s.now)
+	s.p.OnLoss(10_000, s.now)
+	s.step(50_000)
+	if s.p.LossCuts() != 1 {
+		t.Fatalf("cuts %d", s.p.LossCuts())
+	}
+	s.p.UndoLoss(10_000, snap, s.now)
+	if s.p.State() == Startup || s.p.LossCuts() != 0 || s.p.inflightLo != 0 {
+		t.Fatalf("state %s cuts %d inflight_lo %d", s.p.State(), s.p.LossCuts(), s.p.inflightLo)
 	}
 }

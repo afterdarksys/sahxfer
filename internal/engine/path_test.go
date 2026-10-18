@@ -24,6 +24,9 @@ type pathCase struct {
 	noStall        bool
 	// An outage drops every DATA sent in [outAt, outAt+outFor).
 	outAt, outFor time.Duration
+	// A reverse outage drops every receiver packet sent in
+	// [revAt, revAt+revFor).
+	revAt, revFor time.Duration
 }
 
 type pathResult struct {
@@ -33,6 +36,7 @@ type pathResult struct {
 	lost   uint64
 	retx   int
 	whole  int
+	undone int
 	goodMB float64
 }
 
@@ -53,6 +57,10 @@ func runPath(t *testing.T, c pathCase, size int) pathResult {
 		ab.qcap = 2*c.delay2 + 10*time.Millisecond
 	}
 	pr.s.noStall = c.noStall
+	ba.filt = func(h frame.Header) (bool, time.Duration) {
+		at := time.Duration(h.SendTimeNS)
+		return c.revFor > 0 && at >= c.revAt && at < c.revAt+c.revFor, 0
+	}
 	retx := 0
 	data := 0
 	drops := 0
@@ -92,6 +100,7 @@ func runPath(t *testing.T, c pathCase, size int) pathResult {
 		lost:   pr.s.pacer.Lost(),
 		retx:   retx,
 		whole:  pr.s.wholeProbes,
+		undone: pr.s.undone,
 		goodMB: float64(size) / now.Seconds() / 1e6,
 	}
 }
@@ -194,11 +203,12 @@ func TestNoSpuriousStallProbe(t *testing.T) {
 
 // A route change raises the delay mid-transfer. FEEDBACK then stops for
 // longer than any wait computed on the old RTT; the stall probe must not
-// read that as loss and resend the window. No range probe may fire, and
-// completion stays within 1.5x of the run with the probe off. The factor
-// is not 1.0 because the one tail-probe segment shifts when startup exits
-// while RTprop is still the old one: measured 1.01x, 0.97x and 1.39x, and
-// a single DATA delayed 3 ms moves the probe-off run by -11% to +2%.
+// read that as loss and resend the window. The pin is on bytes: exactly
+// one retransmitted segment (the tail probe) and no range probe. Time is
+// bounded loosely, 2x the run with the probe off, because the one extra
+// segment shifts when startup exits while RTprop is still the old one
+// (measured 1.01x, 0.97x and 1.39x; one DATA delayed 3 ms moves the
+// probe-off run by -11% to +2%).
 func TestDelayStepNoSpuriousProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("10 MB virtual-clock transfers")
@@ -214,8 +224,45 @@ func TestDelayStepNoSpuriousProbe(t *testing.T) {
 		c.noStall = false
 		got := runPath(t, c, 10_000_000)
 		t.Logf("%v->%v: %v (probe off %v), %d retx, %d whole-range probes", d[0], d[1], got.took, base.took, got.retx, got.whole)
-		if got.whole != 0 || got.took > base.took*3/2 {
-			t.Fatalf("%v->%v: %v vs probe off %v, %d whole-range probes", d[0], d[1], got.took, base.took, got.whole)
+		if got.retx != 1 || got.whole != 0 || got.took > base.took*2 {
+			t.Fatalf("%v->%v: %v vs probe off %v, %d retransmitted segments, %d range probes", d[0], d[1], got.took, base.took, got.retx, got.whole)
+		}
+	}
+}
+
+// A reverse-path outage loses only FEEDBACK and NACK: every DATA arrives.
+// The stall probes fire, but the first FEEDBACK after the outage shows the
+// receiver already held every released byte with no repair having added
+// any, so the range probe is undone: no loss counted, no cut.
+func TestReverseOutageUndone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("virtual-clock transfers")
+	}
+	for _, x := range []time.Duration{1500 * time.Millisecond, 3 * time.Second} {
+		c := pathCase{bps: 5e6, delay: 20 * time.Millisecond, revAt: time.Second, revFor: x}
+		r := runPath(t, c, 10_000_000)
+		t.Logf("reverse outage %v: %v, %d range probes, %d undone, %d retx, lost %d, cuts %d", x, r.took, r.whole, r.undone, r.retx, r.lost, r.cuts)
+		if r.whole == 0 || r.undone != r.whole {
+			t.Fatalf("outage %v: %d range probes, %d undone", x, r.whole, r.undone)
+		}
+		if r.lost != 0 || r.cuts != 0 || r.drops != 0 {
+			t.Fatalf("outage %v: lost %d cuts %d drops %d", x, r.lost, r.cuts, r.drops)
+		}
+	}
+}
+
+// A forward outage loses DATA for real: the range probe's loss must stand.
+// The first FEEDBACK after the probe can show no repair yet, so only the
+// contig condition keeps the undo from firing.
+func TestForwardOutageNotUndone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("virtual-clock transfers")
+	}
+	for _, delay := range []time.Duration{20 * time.Millisecond, 40 * time.Millisecond} {
+		c := pathCase{bps: 5e6, delay: delay, outAt: time.Second, outFor: 300 * time.Millisecond}
+		r := runPath(t, c, 6_000_000)
+		if r.whole == 0 || r.undone != 0 || r.lost == 0 || r.cuts == 0 {
+			t.Fatalf("delay %v: %d range probes, %d undone, lost %d, cuts %d", delay, r.whole, r.undone, r.lost, r.cuts)
 		}
 	}
 }

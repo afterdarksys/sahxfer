@@ -145,6 +145,13 @@ type Peer struct {
 	probes    uint
 	fbDeliv   uint64
 	recheckAt time.Duration
+	// undo is the open record of the last range probe; holdNew keeps new
+	// DATA back until the first FEEDBACK after it (section 4.5, undo).
+	undo    *stallUndo
+	holdNew bool
+	undone  int
+	// fbHighSeq is the largest highest_seq_received seen on FEEDBACK.
+	fbHighSeq uint64
 	// noStall turns the stall probe off; tests use it as a baseline.
 	noStall bool
 	// wholeProbes counts stall probes that resent a range (not a TLP).
@@ -166,6 +173,14 @@ type Peer struct {
 	doneSent    bool
 	hashedTo    uint64
 	doneSum     []byte
+}
+
+// stallUndo records a range probe that may prove spurious.
+type stallUndo struct {
+	lost uint64       // bytes counted as lost
+	seq  uint64       // first seq sealed after the probe
+	end  uint64       // end of the highest released range
+	snap cc.LossState // controller loss state before the probe
 }
 
 type sentSeg struct {
@@ -614,7 +629,7 @@ func (p *Peer) wantData() bool {
 	if p.state != stSending && p.state != stFlushing {
 		return false
 	}
-	return len(p.retx) > 0 || p.nextNew < p.cfg.Size
+	return len(p.retx) > 0 || (p.nextNew < p.cfg.Size && !p.holdNew)
 }
 
 func (p *Peer) sendData(now time.Duration) {
@@ -623,7 +638,7 @@ func (p *Peer) sendData(now time.Duration) {
 	}
 	for {
 		sp, retx, ok := p.nextSpan()
-		if !ok {
+		if !ok || (!retx && p.holdNew) {
 			return
 		}
 		n := sp.End - sp.Start
@@ -807,20 +822,27 @@ func (p *Peer) maybeStall(now time.Duration) {
 		p.recheckAt = retry
 		return
 	}
-	var n uint64
+	var n, end uint64
 	keep := p.inflight[:0]
 	for i, s := range p.inflight {
 		if release[i] {
 			n += s.n
+			if s.end > end {
+				end = s.end
+			}
 			continue
 		}
 		keep = append(keep, s)
 	}
 	p.inflight = keep
+	u := &stallUndo{lost: lost, seq: p.seq + 1, end: end}
 	if p.pacer != nil {
+		u.snap = p.pacer.SaveLoss()
 		p.pacer.OnFilled(n, now)
 		p.pacer.OnLoss(lost, now)
 	}
+	p.undo = u
+	p.holdNew = true
 	p.wholeProbes++
 	p.probes++
 	p.progAt = now
@@ -836,8 +858,9 @@ func (p *Peer) maybeFIN(now time.Duration) {
 		flags = frame.FlagCloseAck
 	}
 	if !p.send(now, frame.Header{Type: frame.TypeFIN, Flags: flags, Offset: p.cfg.Size}, nil) {
-		// Only a spent sequence space fails a send: a wrap aborts the
-		// grant, and WakeAt cannot keep returning now for a FIN.
+		// A failed seal (spent sequence space, a wiped session, bad
+		// arguments) cannot be retried: abort, or WakeAt would keep
+		// returning now for a FIN that never leaves.
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
@@ -1114,6 +1137,10 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
+	// Judge an open range-probe record before this FEEDBACK reaches the
+	// controller, so a spurious loss never ends a round.
+	p.checkUndo(h.Offset, f.HighestSeq, now)
+	p.holdNew = false
 	p.noteContig(h.Offset, now)
 	if p.pacer != nil {
 		// A peer cannot have received more unique bytes than left here.
@@ -1137,6 +1164,36 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 	if f.EchoSendTimeNS > p.lastEcho && uint64(now) >= f.EchoSendTimeNS {
 		p.lastEcho = f.EchoSendTimeNS
 		p.noteRTT(now-time.Duration(f.EchoSendTimeNS), now)
+	}
+}
+
+// checkUndo closes the range-probe record (section 4.5, undo). The
+// receiver raises highest_seq_received only for DATA that added bytes, and
+// no new DATA is sealed after the probe until a FEEDBACK arrives, so a seq
+// below undo.seq with contig past every released range means the receiver
+// already had them: the probe was spurious and its loss is removed.
+func (p *Peer) checkUndo(contig, highSeq uint64, now time.Duration) {
+	seen := p.fbHighSeq
+	if highSeq > p.fbHighSeq {
+		p.fbHighSeq = highSeq
+	}
+	u := p.undo
+	if u == nil {
+		return
+	}
+	switch {
+	case highSeq == 0 || highSeq < seen:
+		// Not the section 4.4 rule: keep the loss.
+		p.undo = nil
+	case highSeq < u.seq && contig >= u.end:
+		if p.pacer != nil {
+			p.pacer.UndoLoss(u.lost, u.snap, now)
+		}
+		// noteContig drops the queued repairs below contig.
+		p.undone++
+		p.undo = nil
+	case highSeq >= u.seq:
+		p.undo = nil
 	}
 }
 

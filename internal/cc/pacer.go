@@ -97,6 +97,8 @@ type Pacer struct {
 	phaseStart  time.Duration
 	probeUntil  time.Duration
 	probeMin    time.Duration // least RTT sample during PROBE_RTT
+	srtt        time.Duration // EWMA of OnRTT samples, gain 1/8
+	startupCut  uint64        // the cut that ended STARTUP, 0 if none
 	ce          uint64
 	cuts        uint64
 	lostTotal   uint64
@@ -126,6 +128,55 @@ func (p *Pacer) Cap() uint64 { return p.cap }
 
 // LossCuts counts the loss responses that lowered inflight_lo and bw_lo.
 func (p *Pacer) LossCuts() uint64 { return p.cuts }
+
+// LossState is the controller's loss state, saved before a loss that may
+// be undone (docs/design.md section 4.5, undo).
+type LossState struct {
+	cuts       uint64
+	state      State
+	stagnant   int
+	inflightLo uint64
+	bwLo       float64
+}
+
+// SaveLoss returns the loss state for a later UndoLoss.
+func (p *Pacer) SaveLoss() LossState {
+	return LossState{cuts: p.cuts, state: p.state, stagnant: p.stagnant, inflightLo: p.inflightLo, bwLo: p.bwLo}
+}
+
+// UndoLoss removes lost bytes reported after s was saved and reverts a
+// loss round since then: inflight_lo, bw_lo, and a STARTUP it ended.
+func (p *Pacer) UndoLoss(lost uint64, s LossState, now time.Duration) {
+	if lost > p.lostTotal {
+		lost = p.lostTotal
+	}
+	p.lostTotal -= lost
+	take := func(v *uint64) {
+		d := lost
+		if d > *v {
+			d = *v
+		}
+		*v -= d
+		lost -= d
+	}
+	take(&p.roundLost)
+	for i := 1; i <= lossRounds && lost > 0; i++ {
+		take(&p.lossWin[((p.lossN-i)%lossRounds+lossRounds)%lossRounds][0])
+	}
+	if p.cuts > s.cuts {
+		p.cuts = s.cuts
+		p.inflightLo = s.inflightLo
+		p.bwLo = s.bwLo
+		// Restore STARTUP only if a reverted cut is what ended it.
+		if s.state == Startup && p.startupCut > s.cuts && (p.state == Drain || p.state == ProbeBW) {
+			p.startupCut = 0
+			p.state = Startup
+			p.gain = startupGain
+			p.stagnant = s.stagnant
+		}
+	}
+	p.update(now)
+}
 
 // Lost is the total newly lost bytes reported through OnLoss and OnECN.
 func (p *Pacer) Lost() uint64 { return p.lostTotal }
@@ -202,6 +253,11 @@ func (p *Pacer) OnRTT(rtt, now time.Duration) {
 	if rtt <= 0 {
 		return
 	}
+	if p.srtt == 0 {
+		p.srtt = rtt
+	} else {
+		p.srtt = (7*p.srtt + rtt) / 8
+	}
 	if !p.haveRTT || rtt <= p.minRTT {
 		p.minRTT = rtt
 		p.minRTTAt = now
@@ -224,10 +280,11 @@ func (p *Pacer) OnLoss(lost uint64, now time.Duration) {
 // cut is the response to a loss round: leave startup, set inflight_lo and
 // bw_lo.
 func (p *Pacer) cut() {
+	p.cuts++
 	if p.state == Startup {
 		p.enterDrain()
+		p.startupCut = p.cuts
 	}
-	p.cuts++
 	lo := uint64(float64(p.inflight) * lossBeta)
 	if b := p.bdp(); b > lo {
 		lo = b
@@ -305,8 +362,15 @@ func (p *Pacer) update(now time.Duration) {
 			// RTprop becomes the least sample taken during the probe, so
 			// it can rise after a route change; its age restarts either
 			// way, or the 10 s check would re-enter on the next call.
-			if p.probeMin > 0 {
-				p.minRTT = p.probeMin
+			// Not above srtt: one probe of outlier samples cannot
+			// raise RTprop past what the path has been showing.
+			if m := p.probeMin; m > 0 {
+				if p.srtt > 0 && m > p.srtt {
+					m = p.srtt
+				}
+				if m > p.minRTT {
+					p.minRTT = m
+				}
 			}
 			p.minRTTAt = now
 			p.enterProbe(now)

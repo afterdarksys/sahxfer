@@ -128,7 +128,7 @@ u64 ecn_ce_count
 u64 recv_rate_bps
 ```
 
-`offset` is the highest contiguous file byte, the same value as on a NACK. Cadence is `max(5 ms, srtt / 4)`, and at least every 64 accepted `DATA` packets. The sender retransmits on NACK, plus a stall probe. FEEDBACK does not request a retransmission.
+`offset` is the highest contiguous file byte, the same value as on a NACK. `highest_seq_received` is the highest `seq` of a `DATA` that added bytes the receiver did not hold; a duplicate does not raise it, and it never decreases. The sender's stall-probe undo depends on this. Cadence is `max(5 ms, srtt / 4)`, and at least every 64 accepted `DATA` packets. The sender retransmits on NACK, plus a stall probe. FEEDBACK does not request a retransmission.
 
 pace-bbr uses this sample. It runs on UDP. `quic-datagram` and `quic-bridge` turn inner pacing off, because QUIC already paces that hop.
 
@@ -139,7 +139,7 @@ pace-bbr uses this sample. It runs on UDP. `quic-datagram` and `quic-bridge` tur
 - The sender, after every byte has been transmitted once, enters `FLUSHING` and sends `FIN` every RTT.
 - The receiver commits, then sends `DONE` every RTT until a `FIN` with `CLOSE_ACK` arrives, or until idle.
 - The sender accepts `DONE` only when the hash and the size match the grant, then sets `CLOSE_ACK` on later `FIN`.
-- In `SENDING` or `FLUSHING`, if bytes above the contiguous offset are in flight and neither that offset nor `delivered_bytes` has advanced for `W = 2 * max(srtt + 4 * rttvar, 5 ms)` (1 s before the first RTT sample), the sender retransmits its highest in-flight segment with `RETX`. If that is followed by no progress for `max(2 * W, 1 s)`, it retransmits every in-flight range with `RETX`, doubling that wait per repeat up to 8 s. In `FLUSHING` the sender keeps sending `FIN`.
+- In `SENDING` or `FLUSHING`, if bytes above the contiguous offset are in flight and neither that offset nor `delivered_bytes` has advanced for `W = 2 * max(srtt + 4 * rttvar, 5 ms)` (1 s before the first RTT sample), the sender retransmits its highest in-flight segment with `RETX`. If that is followed by no progress for `max(2 * W, 1 s)`, it retransmits every in-flight range older than the repair timeout (`2 * srtt`) with `RETX`, doubling that wait per repeat up to 8 s. In `FLUSHING` the sender keeps sending `FIN`.
 
 Give-up is `max_seconds` or `idle_seconds`, then `ABORT` with `expired` or `idle`.
 

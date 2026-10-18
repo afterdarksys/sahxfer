@@ -1266,3 +1266,121 @@ func TestStallBackoffResetsOnProgress(t *testing.T) {
 		t.Fatalf("after progress: probes %d wait %v, want 0 and %v", pr.s.probes, pr.s.stallWait(), w)
 	}
 }
+
+// Mixed range probe: the old segment with no younger overlap is queued and
+// released; the one a younger send overlaps is refused and stays in flight.
+func TestStallRangeProbeMixed(t *testing.T) {
+	now := 2 * time.Second
+	young := now - time.Millisecond
+	pr := stalledSender(t, []sentSeg{
+		{start: 0, end: 100, n: 100},
+		{start: 100, end: 200, n: 100},
+		{start: 100, end: 200, n: 100, at: young, retx: true},
+	})
+	pr.s.probes = 1
+	pr.s.maybeStall(now)
+	if len(pr.s.retx) != 1 || pr.s.retx[0] != (frame.Span{Start: 0, End: 100}) {
+		t.Fatalf("queued %v, want [0,100)", pr.s.retx)
+	}
+	if pr.s.pacer.Lost() != 100 || pr.s.wholeProbes != 1 {
+		t.Fatalf("lost %d whole %d", pr.s.pacer.Lost(), pr.s.wholeProbes)
+	}
+	want := []sentSeg{{start: 100, end: 200, n: 100}, {start: 100, end: 200, n: 100, at: young, retx: true}}
+	if len(pr.s.inflight) != 2 || pr.s.inflight[0] != want[0] || pr.s.inflight[1] != want[1] {
+		t.Fatalf("in flight %v, want the refused original and its young repair", pr.s.inflight)
+	}
+}
+
+// The stall clock starts at the oldest in-flight send when that is later
+// than the last progress: a segment is never judged before W has passed
+// since it left.
+func TestStallClockFromOldestSend(t *testing.T) {
+	sent := time.Second
+	pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100, at: sent}})
+	pr.s.progAt = 0
+	w := pr.s.stallWait()
+	pr.s.maybeStall(sent + w - time.Millisecond)
+	if len(pr.s.retx) != 0 {
+		t.Fatal("probed before W had passed since the oldest send")
+	}
+	pr.s.maybeStall(sent + w)
+	if len(pr.s.retx) != 1 {
+		t.Fatal("no tail probe W after the oldest send")
+	}
+}
+
+// W includes 4*rttvar: a jittery path waits longer before the tail probe.
+func TestStallWaitIncludesRTTVar(t *testing.T) {
+	pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}})
+	pr.s.rttvar = 10 * time.Millisecond
+	if w := pr.s.stallWait(); w != 100*time.Millisecond {
+		t.Fatalf("W %v, want 2*(10ms + 4*10ms)", w)
+	}
+	pr.s.maybeStall(60 * time.Millisecond)
+	if len(pr.s.retx) != 0 {
+		t.Fatal("tail probe before W on a jittery path")
+	}
+}
+
+// Undo: a FEEDBACK after a range probe whose highest_seq_received is
+// below the probe's first seq, with contig past every released range,
+// removes the probe's loss; one whose seq is at or above it keeps it.
+func TestRangeProbeUndo(t *testing.T) {
+	for _, spurious := range []bool{true, false} {
+		pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}, {start: 100, end: 200, n: 100}})
+		pr.s.probes = 1
+		pr.s.seq = 50
+		pr.s.maybeStall(2 * time.Second)
+		if pr.s.pacer.Lost() != 200 || pr.s.undo == nil || pr.s.undo.seq != 51 || !pr.s.holdNew {
+			t.Fatalf("probe record %+v lost %d hold %v", pr.s.undo, pr.s.pacer.Lost(), pr.s.holdNew)
+		}
+		if pr.s.wantData() && len(pr.s.retx) == 0 {
+			t.Fatal("new DATA not held after a range probe")
+		}
+		queued := pr.s.retx
+		pr.s.retx = nil // as if the repairs had left
+		pr.s.Take()
+		pr.s.sendData(2 * time.Second)
+		if n := countType(pr.s.Take(), frame.TypeDATA); n != 0 {
+			t.Fatalf("%d new DATA sealed before the first FEEDBACK after the probe", n)
+		}
+		pr.s.retx = queued
+		hs := uint64(40)
+		if !spurious {
+			hs = 51
+		}
+		pr.s.Recv(2*time.Second+time.Millisecond, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: 1, Offset: 200},
+			frame.EncodeFeedback(frame.Feedback{DeliveredBytes: 200, HighestSeq: hs}), seal.DirAgent))
+		if pr.s.undo != nil || pr.s.holdNew {
+			t.Fatalf("spurious=%v: record still open or hold kept", spurious)
+		}
+		wantLost := uint64(0)
+		if !spurious {
+			wantLost = 200
+		}
+		if pr.s.pacer.Lost() != wantLost || len(pr.s.retx) != 0 {
+			t.Fatalf("spurious=%v: lost %d retx %v", spurious, pr.s.pacer.Lost(), pr.s.retx)
+		}
+	}
+}
+
+// A receiver that reports highest_seq_received 0, or lower than it already
+// reported, does not follow the section 4.4 rule: no undo, the loss stays.
+func TestRangeProbeUndoRefusesNonConforming(t *testing.T) {
+	for _, hs := range []uint64{0, 40} {
+		pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}, {start: 100, end: 200, n: 100}})
+		pr.s.Recv(time.Second, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: 1},
+			frame.EncodeFeedback(frame.Feedback{DeliveredBytes: 0, HighestSeq: 45}), seal.DirAgent))
+		pr.s.probes = 1
+		pr.s.seq = 50
+		pr.s.maybeStall(3 * time.Second)
+		if pr.s.undo == nil || pr.s.pacer.Lost() != 200 {
+			t.Fatalf("hs=%d: no probe record", hs)
+		}
+		pr.s.Recv(3*time.Second+time.Millisecond, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: 2, Offset: 200},
+			frame.EncodeFeedback(frame.Feedback{DeliveredBytes: 200, HighestSeq: hs}), seal.DirAgent))
+		if pr.s.undone != 0 || pr.s.pacer.Lost() != 200 || pr.s.undo != nil {
+			t.Fatalf("hs=%d: undone %d lost %d record %v", hs, pr.s.undone, pr.s.pacer.Lost(), pr.s.undo)
+		}
+	}
+}
