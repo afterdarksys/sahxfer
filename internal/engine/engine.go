@@ -17,6 +17,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/afterdarksys/sahxfer/internal/cc"
@@ -131,7 +132,7 @@ type Peer struct {
 	extraPing  bool
 	probe      uint64
 	rxPingSent bool
-	rxRePing   bool
+	rePinged   bool
 
 	nextNew        uint64
 	contig         uint64
@@ -151,6 +152,8 @@ type Peer struct {
 	dataSinceFB int
 	fbLost      uint64
 	highSeq     uint64
+	highSent    uint64
+	lastEcho    uint64
 	lastDONE    time.Duration
 	doneSent    bool
 	hashedTo    uint64
@@ -162,7 +165,6 @@ type sentSeg struct {
 	n          uint64
 	at         time.Duration
 	retx       bool
-	done       bool
 }
 
 // New checks the grant shape and opens the AEAD session.
@@ -283,6 +285,7 @@ func (p *Peer) Pump(now time.Duration) {
 		return
 	}
 	if p.cfg.Sender {
+		p.maybeRePing(now)
 		p.maybePing(now)
 		p.maybeTail(now)
 		if p.state == stFlushing || p.state == stDone {
@@ -297,12 +300,7 @@ func (p *Peer) Pump(now time.Duration) {
 		p.emitPing(now)
 		p.rxPingSent = true
 	}
-	if p.sawPeer && !p.rxRePing {
-		p.rxRePing = true
-		if p.lastPing < p.firstRx {
-			p.emitPing(now)
-		}
-	}
+	p.maybeRePing(now)
 	p.maybeNACK(now)
 	p.maybeFeedback(now)
 	p.maybeVerify(now)
@@ -413,7 +411,7 @@ func (p *Peer) WakeAt(now time.Duration) time.Duration {
 	}
 	if !p.cfg.Sender {
 		if !p.fbSent {
-			consider(p.start + 5*time.Millisecond)
+			consider(p.start + cc.FeedbackFloor)
 		} else {
 			consider(p.lastFB + p.fbEvery())
 		}
@@ -555,6 +553,18 @@ func (p *Peer) emitPing(now time.Duration) {
 	p.send(now, frame.Header{Type: frame.TypePING, Offset: p.probe}, nil)
 	p.pings++
 	p.lastPing = now
+}
+
+// maybeRePing sends one fresh PING when this peer first hears the other,
+// if every PING so far predates that. onPong drops those as stale.
+func (p *Peer) maybeRePing(now time.Duration) {
+	if !p.sawPeer || p.rePinged {
+		return
+	}
+	p.rePinged = true
+	if p.pings > 0 && p.lastPing < p.firstRx {
+		p.emitPing(now)
+	}
 }
 
 func (p *Peer) maybePing(now time.Duration) {
@@ -729,9 +739,6 @@ func (p *Peer) queueRetx(sp frame.Span, now time.Duration) {
 func (p *Peer) recent(sp frame.Span, now time.Duration) bool {
 	win := p.rtt()
 	for _, s := range p.inflight {
-		if s.done {
-			continue
-		}
 		if s.start < sp.End && s.end > sp.Start && now-s.at < win {
 			return true
 		}
@@ -747,15 +754,18 @@ func (p *Peer) noteContig(c uint64, now time.Duration) {
 	if c <= p.contig {
 		return
 	}
+	// Filled segments leave the list, so it holds only what is in flight
+	// and a scan costs the window, not the file.
 	var filled uint64
-	for i := range p.inflight {
-		s := &p.inflight[i]
-		if s.done || s.end > c {
+	keep := p.inflight[:0]
+	for _, s := range p.inflight {
+		if s.end <= c {
+			filled += s.n
 			continue
 		}
-		s.done = true
-		filled += s.n
+		keep = append(keep, s)
 	}
+	p.inflight = keep
 	p.contig = c
 	if p.pacer != nil && filled > 0 {
 		p.pacer.OnFilled(filled, now)
@@ -827,6 +837,7 @@ func (p *Peer) onData(now time.Duration, h frame.Header, pt []byte) {
 	}
 	if h.Seq > p.highSeq {
 		p.highSeq = h.Seq
+		p.highSent = h.SendTimeNS
 	}
 	p.dataSinceFB++
 	p.foldHash(now)
@@ -884,16 +895,15 @@ func (p *Peer) onNACK(now time.Duration, h frame.Header, pt []byte) {
 // Retransmissions stay until noteContig covers them.
 func (p *Peer) releaseForRetx(sp frame.Span, now time.Duration) {
 	var n uint64
-	for i := range p.inflight {
-		s := &p.inflight[i]
-		if s.done || s.retx {
+	keep := p.inflight[:0]
+	for _, s := range p.inflight {
+		if !s.retx && s.start >= sp.Start && s.end <= sp.End {
+			n += s.n
 			continue
 		}
-		if s.start >= sp.Start && s.end <= sp.End {
-			s.done = true
-			n += s.n
-		}
+		keep = append(keep, s)
 	}
+	p.inflight = keep
 	if p.pacer != nil && n > 0 {
 		p.pacer.OnFilled(n, now)
 	}
@@ -914,7 +924,12 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 	}
 	p.noteContig(h.Offset, now)
 	if p.pacer != nil {
-		p.pacer.Sample(f.DeliveredBytes, now)
+		// A peer cannot have received more unique bytes than left here.
+		d := f.DeliveredBytes
+		if d > p.nextNew {
+			d = p.nextNew
+		}
+		p.pacer.Sample(d, now)
 		if f.NewlyLostBytes > 0 {
 			p.pacer.OnLoss(now)
 		}
@@ -922,7 +937,10 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 			p.pacer.OnECN(f.ECNCECount, now)
 		}
 	}
-	if f.EchoSendTimeNS > 0 && uint64(now) >= f.EchoSendTimeNS {
+	// A repeated echo is not a sample: the same old send time on every
+	// timer FEEDBACK would grow srtt, and the FIN retry with it.
+	if f.EchoSendTimeNS > p.lastEcho && uint64(now) >= f.EchoSendTimeNS {
+		p.lastEcho = f.EchoSendTimeNS
 		p.noteRTT(now-time.Duration(f.EchoSendTimeNS), now)
 	}
 }
@@ -1005,7 +1023,7 @@ func (p *Peer) onPong(now time.Duration, h frame.Header, pt []byte) {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
-	stale := !p.cfg.Sender && time.Duration(echo) < p.firstRx
+	stale := time.Duration(echo) < p.firstRx
 	if !stale && uint64(now) >= echo+delay {
 		p.noteRTT(now-time.Duration(echo)-time.Duration(delay), now)
 	}
@@ -1034,6 +1052,11 @@ func (p *Peer) maybeNACK(now time.Duration) {
 	if len(mature) > frame.MaxNACKHoles {
 		mature = mature[:frame.MaxNACKHoles]
 	}
+	// Mature is oldest first, so the cut keeps the oldest holes. Any accept
+	// that ends inside a hole, including one that starts inside it,
+	// re-births the remainder above it, so age is not offset order, and a NACK lists its holes in offset order
+	// (PROTOCOL 4.1).
+	sort.Slice(mature, func(i, j int) bool { return mature[i].Start < mature[j].Start })
 	var nb uint64
 	for _, h := range mature {
 		nb += h.End - h.Start
@@ -1056,8 +1079,8 @@ func (p *Peer) maybeNACK(now time.Duration) {
 
 func (p *Peer) fbEvery() time.Duration {
 	q := p.srtt / 4
-	if q < 5*time.Millisecond {
-		return 5 * time.Millisecond
+	if q < cc.FeedbackFloor {
+		return cc.FeedbackFloor
 	}
 	return q
 }
@@ -1083,7 +1106,11 @@ func (p *Peer) maybeFeedback(now time.Duration) {
 	if now > p.start {
 		rate = uint64(float64(p.holes.Delivered()) / (now - p.start).Seconds())
 	}
-	echo := uint64(0)
+	// Echo only DATA accepted since the previous FEEDBACK.
+	var echo uint64
+	if p.dataSinceFB > 0 {
+		echo = p.highSent
+	}
 	f := frame.Feedback{
 		EchoSendTimeNS: echo,
 		DeliveredBytes: p.holes.Delivered(),
@@ -1091,9 +1118,8 @@ func (p *Peer) maybeFeedback(now time.Duration) {
 		HighestSeq:     p.highSeq,
 		RecvRateBps:    rate,
 	}
-	// Echo the newest accepted send time. We did not store it per packet;
-	// a zero echo simply skips the sender's RTT sample from FEEDBACK.
-	// PING/PONG still clocks RTT.
+	// The sender's sample includes this FEEDBACK's hold; its min filter
+	// discards that.
 	if p.send(now, frame.Header{Type: frame.TypeFEEDBACK, Offset: p.holes.Contiguous()}, frame.EncodeFeedback(f)) {
 		p.fbSent = true
 		p.lastFB = now

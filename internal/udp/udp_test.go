@@ -279,20 +279,38 @@ func TestLateSenderLoopbackThroughput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("realistic-size loopback transfer")
 	}
-	file := make([]byte, 2_000_000)
+	loopbackThroughput(t, 2_000_000, time.Second, 4*time.Second)
+}
+
+// FEEDBACK frees the window at most every 5 ms. A window of 10*MSS
+// against that floor held loopback to about 2 MB/s (30 MB in 14.7 s).
+// The cap covers max(RTprop, 5 ms) with BBR's window gain
+// (docs/design.md section 6).
+func TestLoopbackThroughput30MB(t *testing.T) {
+	if testing.Short() {
+		t.Skip("realistic-size loopback transfer")
+	}
+	loopbackThroughput(t, 30_000_000, 0, 6*time.Second)
+}
+
+func loopbackThroughput(t *testing.T, size int, late, bound time.Duration) {
+	t.Helper()
+	file := make([]byte, size)
 	for i := range file {
 		file[i] = byte(i*7 + i>>11)
 	}
 	e := newEnds(t, file, uint64(len(file)))
+	// Preallocate so memFile does not regrow on every in-order write.
+	e.dst.b = make([]byte, len(file))
 	lc := listen(t)
 	dc := dial(t, lc.LocalAddr())
 	defer lc.Close()
 	defer dc.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), bound+late+10*time.Second)
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() { errc <- Run(ctx, Config{Peer: e.r, Conn: lc}) }()
-	time.Sleep(time.Second)
+	time.Sleep(late)
 	began := time.Now()
 	txErr := Run(ctx, Config{Peer: e.s, Conn: dc, Connected: true})
 	rxErr := <-errc
@@ -303,8 +321,8 @@ func TestLateSenderLoopbackThroughput(t *testing.T) {
 	if !bytes.Equal(e.dst.b, file) || e.commits != 1 {
 		t.Fatalf("file mismatch or commits=%d", e.commits)
 	}
-	if took > 4*time.Second {
-		t.Fatalf("2 MB on loopback took %v, want under 4s", took)
+	if took > bound {
+		t.Fatalf("%d bytes on loopback took %v, want under %v", size, took, bound)
 	}
-	t.Logf("2 MB in %v", took)
+	t.Logf("%d bytes in %v (%.1f MB/s)", size, took, float64(size)/took.Seconds()/1e6)
 }

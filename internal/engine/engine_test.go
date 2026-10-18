@@ -113,6 +113,10 @@ type pipe struct {
 	delay time.Duration
 	q     []queued
 	filt  func(frame.Header) (drop bool, extra time.Duration)
+	// bps, when set, serializes datagrams at that many bytes per second
+	// ahead of the delay, so a queue builds instead of infinite bandwidth.
+	bps  float64
+	free time.Duration
 }
 
 func newPipe() *pipe { return &pipe{delay: time.Millisecond} }
@@ -130,7 +134,15 @@ func (p *pipe) send(now time.Duration, ds [][]byte) {
 				extra = ex
 			}
 		}
-		p.q = append(p.q, queued{at: now + p.delay + extra, d: append([]byte(nil), d...)})
+		at := now
+		if p.bps > 0 {
+			if p.free > at {
+				at = p.free
+			}
+			at += time.Duration(float64(len(d)) / p.bps * 1e9)
+			p.free = at
+		}
+		p.q = append(p.q, queued{at: at + p.delay + extra, d: append([]byte(nil), d...)})
 	}
 }
 
@@ -193,6 +205,10 @@ func runUntil(pr *pair, ab, ba *pipe, limit time.Duration) (time.Duration, error
 		sd, rd := pr.s.Take(), pr.r.Take()
 		ab.send(now, sd)
 		ba.send(now, rd)
+		// Report the time both finished, not the next wake (now + Max).
+		if pr.s.OK() && pr.r.OK() {
+			return now, nil
+		}
 		next := now + time.Hour
 		consider := func(t0 time.Duration) {
 			if t0 > now && t0 < next {
@@ -770,5 +786,281 @@ func TestErrorsOmitSecrets(t *testing.T) {
 	pr.r.Recv(0, forge(t, frame.Header{Type: 99, Seq: 1, TransferID: 7}, nil, seal.DirClient))
 	if containsSecret(pr.r.Err().Error()) {
 		t.Fatal(pr.r.Err())
+	}
+}
+
+// A relay holds the sender's first PING until the receiver pins. Its PONG
+// predates the first packet the sender heard and must not become srtt.
+func TestSenderDropsHeldPingSample(t *testing.T) {
+	pr := newPair(t, bytes.Repeat([]byte{9}, 300), 100, nil)
+	pr.s.Pump(0)
+	held := pr.s.Take()
+	if countType(held, frame.TypePING) != 1 {
+		t.Fatalf("first sender burst %d PINGs", countType(held, frame.TypePING))
+	}
+	pr.r.Pump(0)
+	ms := time.Millisecond
+	for _, d := range pr.r.Take() {
+		pr.s.Recv(ms, d)
+	}
+	pr.s.Pump(ms)
+	fresh := pr.s.Take()
+	if countType(fresh, frame.TypePING) != 1 {
+		t.Fatal("sender did not PING again on first hearing the receiver")
+	}
+	for _, d := range fresh {
+		pr.r.Recv(2*ms, d)
+	}
+	pr.r.Pump(2 * ms)
+	for _, d := range pr.r.Take() {
+		pr.s.Recv(3*ms, d)
+	}
+	if !pr.s.haveRTT || pr.s.srtt > 10*ms {
+		t.Fatalf("fresh PING srtt %v have %v", pr.s.srtt, pr.s.haveRTT)
+	}
+	// The held PING reaches the receiver 500 ms late.
+	for _, d := range held {
+		pr.r.Recv(500*ms, d)
+	}
+	pr.r.Pump(500 * ms)
+	for _, d := range pr.r.Take() {
+		pr.s.Recv(501*ms, d)
+	}
+	if pr.s.srtt > 10*ms {
+		t.Fatalf("held PING moved srtt to %v", pr.s.srtt)
+	}
+}
+
+// Every PONG but the first is dropped, and that one answers a PING sent
+// before the sender heard the receiver, 20 ms late. Only the FEEDBACK
+// echo can give the sender an RTT. The pipe is 1 ms each way and the
+// FEEDBACK hold is at most 5 ms.
+func TestFeedbackEchoGivesRTT(t *testing.T) {
+	file := bytes.Repeat([]byte{6}, 5000)
+	pr := newPair(t, file, 100, nil)
+	ba := newPipe()
+	pongs := 0
+	ba.filt = func(h frame.Header) (bool, time.Duration) {
+		if h.Type != frame.TypePONG {
+			return false, 0
+		}
+		pongs++
+		return pongs > 1, 20 * time.Millisecond
+	}
+	mustFinish(t, pr, newPipe(), ba)
+	if !bytes.Equal(pr.dst.b, file) {
+		t.Fatal("file mismatch")
+	}
+	if !pr.s.haveRTT || pr.s.srtt < 2*time.Millisecond || pr.s.srtt > 7*time.Millisecond {
+		t.Fatalf("srtt from FEEDBACK %v have %v", pr.s.srtt, pr.s.haveRTT)
+	}
+}
+
+// A partial repair re-births the rest of a hole, so the oldest hole can sit
+// above a younger one. The NACK must still list holes in offset order; an
+// age-ordered list failed EncodeNACK and aborted the grant with protocol.
+func TestNACKHolesInOffsetOrder(t *testing.T) {
+	pr := newPair(t, bytes.Repeat([]byte{2}, 1000), 100, nil)
+	ms := time.Millisecond
+	data := func(at time.Duration, seq, off uint64) {
+		pr.r.Recv(at, forge(t, frame.Header{
+			Type: frame.TypeDATA, TransferID: 7, Seq: seq, Offset: off, SendTimeNS: uint64(at),
+		}, bytes.Repeat([]byte{2}, 100), seal.DirClient))
+	}
+	data(0, 1, 0)
+	data(ms, 2, 300)   // hole [100,300) born 0
+	data(2*ms, 3, 600) // hole [400,600) born 1 ms
+	data(3*ms, 4, 100) // repair re-births [200,300) at 3 ms
+	pr.r.Pump(3 * ms)
+	if err := pr.r.Err(); err != nil {
+		t.Fatalf("receiver aborted: %v", err)
+	}
+	out := pr.r.Take()
+	if countType(out, frame.TypeNACK) != 1 {
+		t.Fatalf("NACKs %d", countType(out, frame.TypeNACK))
+	}
+	key, tok := testMaterial()
+	sess, err := seal.New(key, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Wipe()
+	for _, d := range out {
+		h, pt, err := sess.Open(d, seal.DirAgent)
+		if err != nil || h.Type != frame.TypeNACK {
+			continue
+		}
+		holes, err := frame.DecodeNACK(pt, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []frame.Span{{Start: 200, End: 300}, {Start: 400, End: 600}}
+		if len(holes) != 2 || holes[0] != want[0] || holes[1] != want[1] {
+			t.Fatalf("holes %v, want %v", holes, want)
+		}
+	}
+}
+
+// After the last DATA, timer FEEDBACKs must not repeat an old echo into the
+// sender's srtt. A repeated echo once grew srtt by 5 ms per FEEDBACK, the FIN
+// retry backed off with it, and 9+ lost FINs ended in idle at 5 s.
+func TestFINLossBurst(t *testing.T) {
+	for n := 1; n <= 12; n++ {
+		file := bytes.Repeat([]byte{8}, 3000)
+		pr := newPair(t, file, 100, nil)
+		ab := newPipe()
+		fins := 0
+		ab.filt = func(h frame.Header) (bool, time.Duration) {
+			if h.Type != frame.TypeFIN {
+				return false, 0
+			}
+			fins++
+			return fins <= n, 0
+		}
+		now, err := runUntil(pr, ab, newPipe(), 3*time.Second)
+		if err != nil {
+			t.Fatalf("n=%d at %s: %v", n, now, err)
+		}
+		if now > 500*time.Millisecond || pr.s.srtt > 20*time.Millisecond {
+			t.Fatalf("n=%d done at %s srtt %v", n, now, pr.s.srtt)
+		}
+		if !bytes.Equal(pr.dst.b, file) {
+			t.Fatalf("n=%d file mismatch", n)
+		}
+	}
+}
+
+// An authenticated peer that reports more delivered bytes than were sent
+// cannot raise the pacer past what left the sender.
+func TestFeedbackDeliveredClamped(t *testing.T) {
+	file := bytes.Repeat([]byte{1}, 100_000)
+	honest := newPair(t, file, 1000, nil)
+	liar := newPair(t, file, 1000, nil)
+	ms := time.Millisecond
+	for _, pr := range []*pair{honest, liar} {
+		pr.s.Recv(0, forge(t, frame.Header{Type: frame.TypePONG, TransferID: 7, Seq: 1}, frame.EncodePong(0, 0), seal.DirAgent))
+		pr.s.Pump(0)
+		pr.s.Take()
+	}
+	fb := func(pr *pair, seq uint64, at time.Duration, delivered uint64) {
+		pr.s.Recv(at, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: seq},
+			frame.EncodeFeedback(frame.Feedback{DeliveredBytes: delivered}), seal.DirAgent))
+	}
+	sent := honest.s.nextNew
+	if sent == 0 || sent != liar.s.nextNew {
+		t.Fatalf("sent %d / %d", sent, liar.s.nextNew)
+	}
+	fb(honest, 2, 5*ms, 1)
+	fb(liar, 2, 5*ms, 1)
+	fb(honest, 3, 10*ms, sent)
+	fb(liar, 3, 10*ms, 1<<62)
+	if honest.s.pacer.Cap() != liar.s.pacer.Cap() {
+		t.Fatalf("lying FEEDBACK moved cap: honest %d liar %d", honest.s.pacer.Cap(), liar.s.pacer.Cap())
+	}
+}
+
+// 40 mature holes: the oldest 32 go out, in offset order.
+func TestNACK40Holes(t *testing.T) {
+	const size = 8100
+	pr := newPair(t, bytes.Repeat([]byte{2}, size), 100, nil)
+	ms := time.Millisecond
+	seq := uint64(0)
+	data := func(off uint64) {
+		seq++
+		at := time.Duration(seq) * ms
+		pr.r.Recv(at, forge(t, frame.Header{
+			Type: frame.TypeDATA, TransferID: 7, Seq: seq, Offset: off, SendTimeNS: uint64(at),
+		}, bytes.Repeat([]byte{2}, 100), seal.DirClient))
+	}
+	// Descending offsets: each accept re-births the hole above it, so the
+	// higher a hole, the older it is. Holes are [o+100, o+200) for
+	// o = 0, 200, ..., 7800.
+	for off := uint64(8000); ; off -= 200 {
+		data(off)
+		if off == 0 {
+			break
+		}
+	}
+	if got := len(pr.r.holes.Missing()); got != 40 {
+		t.Fatalf("holes %d", got)
+	}
+	now := time.Duration(seq) * ms
+	pr.r.Pump(now)
+	if err := pr.r.Err(); err != nil {
+		t.Fatalf("receiver aborted: %v", err)
+	}
+	key, tok := testMaterial()
+	sess, err := seal.New(key, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Wipe()
+	nacks := 0
+	for _, d := range pr.r.Take() {
+		h, pt, err := sess.Open(d, seal.DirAgent)
+		if err != nil || h.Type != frame.TypeNACK {
+			continue
+		}
+		nacks++
+		holes, err := frame.DecodeNACK(pt, size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(holes) != frame.MaxNACKHoles {
+			t.Fatalf("holes %d", len(holes))
+		}
+		for i, sp := range holes {
+			start := uint64(1700 + 200*i)
+			if sp.Start != start || sp.End != start+100 {
+				t.Fatalf("hole %d = %v, want [%d,%d)", i, sp, start, start+100)
+			}
+		}
+	}
+	if nacks != 1 {
+		t.Fatalf("NACKs %d", nacks)
+	}
+}
+
+// The sender's list of in-flight segments holds the window, not every
+// segment ever sent: each FEEDBACK and NACK scans it, so a list that grew
+// with the file made the sender's work quadratic in the file size.
+func TestInflightListBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("30 MB virtual-clock transfer")
+	}
+	maxLen := func(size int) int {
+		file := make([]byte, size)
+		for i := range file {
+			file[i] = byte(i*13 + i>>9)
+		}
+		pr := newPair(t, file, frame.InternetPlaintext, func(s, r *Config) {
+			s.Max, r.Max = 60*time.Second, 60*time.Second
+		})
+		// Preallocate so memFile does not regrow on every in-order write.
+		pr.dst.b = make([]byte, size)
+		ab := newPipe()
+		ab.bps = 20e6
+		ba := newPipe()
+		most := 0
+		ba.filt = func(h frame.Header) (bool, time.Duration) {
+			if h.Type == frame.TypeFEEDBACK && len(pr.s.inflight) > most {
+				most = len(pr.s.inflight)
+			}
+			return false, 0
+		}
+		now, err := runUntil(pr, ab, ba, 20*time.Second)
+		if err != nil {
+			t.Fatalf("%d bytes at %s: %v", size, now, err)
+		}
+		if !bytes.Equal(pr.dst.b, file) {
+			t.Fatalf("%d bytes: file mismatch", size)
+		}
+		t.Logf("%d bytes: %d segments sent, at most %d listed at a FEEDBACK, done at %s",
+			size, pr.s.seq, most, now)
+		return most
+	}
+	small, large := maxLen(3_000_000), maxLen(30_000_000)
+	if large > 2*small+64 {
+		t.Fatalf("in-flight list grew with the file: %d for 3 MB, %d for 30 MB", small, large)
 	}
 }

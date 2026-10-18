@@ -12,7 +12,21 @@ import "time"
 const (
 	startupGain = 2.89
 	drainGain   = 0.35
+	// cwndGain is BBR's window gain. Without it the cap admits exactly
+	// what the measured bandwidth covers, and startup cannot grow.
+	cwndGain = 2
+	// bwRounds is how many rounds of samples the bandwidth max covers.
+	bwRounds = 10
+	// lossBeta is the post-loss reduction for inflight_lo and bw_lo.
+	lossBeta = 0.85
+	// paceSlack is the most lateness the pacer catches up.
+	paceSlack = time.Millisecond
 )
+
+// FeedbackFloor is the receiver's FEEDBACK cadence floor (PROTOCOL 4.2).
+// Only FEEDBACK frees inflight, so a round and the window both span at
+// least this long. The engine schedules FEEDBACK from the same constant.
+const FeedbackFloor = 5 * time.Millisecond
 
 // State is the pace-bbr mode.
 type State uint8
@@ -49,7 +63,13 @@ type Pacer struct {
 	cap      uint64
 	inflight uint64
 
-	bw          float64
+	bw          float64 // bw_max: max of bwWin
+	bwWin       [bwRounds]float64
+	bwN         int
+	latest      float64
+	bwLo        float64 // 0 when unset
+	inflightLo  uint64  // 0 when unset
+	roundSet    bool
 	prevRoundBW float64
 	stagnant    int
 	minRTT      time.Duration
@@ -111,14 +131,12 @@ func (p *Pacer) CanSend(now time.Duration, n uint64) bool {
 }
 
 // CanRepair reports whether a retransmission of n bytes may leave at now.
-// It paces like CanSend. A repair may sit one segment above the inflight
-// cap so a NACK can still fill a hole after OnLoss cut the cap.
+// It paces like CanSend but is not held by the cap: bytes above a hole stay
+// in flight until the hole fills, so a cap (inflight_lo in particular)
+// could block the only send that frees them.
 func (p *Pacer) CanRepair(now time.Duration, n uint64) bool {
 	p.update(now)
 	if n == 0 || p.inflight+n < p.inflight {
-		return false
-	}
-	if p.inflight > p.cap+p.mss {
 		return false
 	}
 	return now >= p.nextSend
@@ -128,7 +146,14 @@ func (p *Pacer) CanRepair(now time.Duration, n uint64) bool {
 func (p *Pacer) OnSend(n uint64, now time.Duration) {
 	p.update(now)
 	p.inflight += n
-	p.nextSend = now + p.interval(n)
+	// Schedule from the previous slot, not from now, so wake-up lateness
+	// does not lower the rate. A slot more than paceSlack behind means the
+	// sender was idle, not late: no credit, schedule from now.
+	base := p.nextSend
+	if base < now-paceSlack {
+		base = now
+	}
+	p.nextSend = base + p.interval(n)
 }
 
 // OnFilled records that n in-flight bytes are now contiguous at the receiver.
@@ -141,9 +166,15 @@ func (p *Pacer) OnFilled(n uint64, now time.Duration) {
 	p.update(now)
 }
 
-// Sample records cumulative unique delivered bytes.
+// Sample records cumulative unique delivered bytes from one FEEDBACK. A
+// value not above the largest seen is ignored, so a reordered FEEDBACK
+// does not move the count back. The caller clamps it to bytes sent.
+// FEEDBACK arrivals delimit rounds (docs/design.md section 6).
 func (p *Pacer) Sample(delivered uint64, now time.Duration) {
-	p.delivered = delivered
+	if delivered > p.delivered {
+		p.delivered = delivered
+	}
+	p.advanceRound(now)
 	p.update(now)
 }
 
@@ -172,15 +203,23 @@ func (p *Pacer) OnLoss(now time.Duration) {
 	}
 	p.lossSet = true
 	p.lossRound = p.round
-	cut := p.inflight * 85 / 100
-	cap := p.bdp()
-	if cut > cap {
-		cap = cut
+	lo := uint64(float64(p.inflight) * lossBeta)
+	if b := p.bdp(); b > lo {
+		lo = b
 	}
-	if cap < p.mss {
-		cap = p.mss
+	if lo < p.mss {
+		lo = p.mss
 	}
-	p.cap = cap
+	p.inflightLo = lo
+	prev := p.bwLo
+	if prev == 0 {
+		prev = p.bw
+	}
+	p.bwLo = lossBeta * prev
+	if p.latest > p.bwLo {
+		p.bwLo = p.latest
+	}
+	p.cap = p.targetCap()
 }
 
 // OnECN treats an increase in the CE counter as loss.
@@ -215,7 +254,6 @@ func (p *Pacer) enterProbe(now time.Duration) {
 }
 
 func (p *Pacer) update(now time.Duration) {
-	p.advanceRound(now)
 	switch p.state {
 	case Drain:
 		limit := p.bdp()
@@ -226,14 +264,15 @@ func (p *Pacer) update(now time.Duration) {
 			p.enterProbe(now)
 		}
 	case ProbeBW:
-		hold := p.minRTT
-		if hold <= 0 {
-			hold = time.Millisecond
-		}
-		if now-p.phaseStart >= hold {
+		if now-p.phaseStart >= p.roundLen() {
 			p.phase = (p.phase + 1) % len(probeGains)
 			p.phaseStart = now
 			p.gain = probeGains[p.phase]
+			if p.phase == 0 {
+				// A completed cycle probes up again from bw_max.
+				p.bwLo = 0
+				p.inflightLo = 0
+			}
 		}
 	case ProbeRTT:
 		if now >= p.probeUntil {
@@ -258,33 +297,38 @@ func (p *Pacer) update(now time.Duration) {
 		p.cap = 4 * p.mss
 		return
 	}
-	if p.lossSet && p.lossRound == p.round {
-		return
-	}
 	p.cap = p.targetCap()
 }
 
+// advanceRound runs on a FEEDBACK arrival. The first one that delivered
+// bytes starts the first round. A round ends at the first arrival at least
+// roundLen after it began; bytes and time both span arrival to arrival.
 func (p *Pacer) advanceRound(now time.Duration) {
-	rl := p.roundLen()
-	if now < p.roundStart {
+	if !p.roundSet {
+		if p.delivered == 0 {
+			return
+		}
+		p.roundSet = true
+		p.roundStart = now
+		p.roundDeliv = p.delivered
 		return
 	}
-	if now-p.roundStart < rl {
+	if now < p.roundStart || now-p.roundStart < p.roundLen() {
 		return
 	}
 	dt := now - p.roundStart
-	if dt <= 0 {
-		return
-	}
-	if !p.appLimited {
-		acked := uint64(0)
-		if p.delivered >= p.roundDeliv {
-			acked = p.delivered - p.roundDeliv
+	if !p.appLimited && p.delivered > p.roundDeliv {
+		bw := float64(p.delivered-p.roundDeliv) / dt.Seconds()
+		p.latest = bw
+		p.bwWin[p.bwN%bwRounds] = bw
+		p.bwN++
+		p.bw = 0
+		for _, v := range p.bwWin {
+			if v > p.bw {
+				p.bw = v
+			}
 		}
-		if acked > 0 {
-			bw := float64(acked) / dt.Seconds()
-			p.noteBW(bw)
-		}
+		p.noteBW(bw)
 	}
 	p.roundStart = now
 	p.roundDeliv = p.delivered
@@ -295,13 +339,7 @@ func (p *Pacer) noteBW(bw float64) {
 	if bw <= 0 {
 		return
 	}
-	if p.bw == 0 || bw > p.bw {
-		p.bw = bw
-	}
-	// A windowed max: decay toward the latest sample if it is lower, but
-	// keep the max of the recent observation by a 1/8 blend down only when
-	// the new sample is smaller. Tests need the max to stick in startup
-	// and the growth check to see the raw round bandwidth.
+	// Startup growth check on the raw round bandwidth.
 	if p.prevRoundBW > 0 && bw < p.prevRoundBW*1.25 {
 		p.stagnant++
 	} else {
@@ -313,11 +351,21 @@ func (p *Pacer) noteBW(bw float64) {
 	}
 }
 
+// roundLen is L = max(minRTT, FeedbackFloor). A shorter round would divide
+// one FEEDBACK's bytes by a fraction of the time they took.
 func (p *Pacer) roundLen() time.Duration {
-	if p.minRTT > 0 {
+	if p.minRTT > FeedbackFloor {
 		return p.minRTT
 	}
-	return time.Millisecond
+	return FeedbackFloor
+}
+
+// estBW is min(bw_max, bw_lo) while bw_lo is set.
+func (p *Pacer) estBW() float64 {
+	if p.bwLo > 0 && p.bwLo < p.bw {
+		return p.bwLo
+	}
+	return p.bw
 }
 
 func (p *Pacer) bdp() uint64 {
@@ -327,18 +375,23 @@ func (p *Pacer) bdp() uint64 {
 	return uint64(p.bw * p.minRTT.Seconds())
 }
 
+// targetCap is max(2 * bw * L, 10*MSS), then at most inflight_lo: one
+// RTprop plus one FEEDBACK interval of data at the estimated rate, with
+// BBR's window gain (docs/design.md section 6).
 func (p *Pacer) targetCap() uint64 {
-	b := p.bdp()
-	floor := 10 * p.mss
-	if b > floor {
-		return b
+	c := uint64(cwndGain * p.estBW() * p.roundLen().Seconds())
+	if floor := 10 * p.mss; c < floor {
+		c = floor
 	}
-	return floor
+	if p.inflightLo > 0 && p.inflightLo < c {
+		c = p.inflightLo
+	}
+	return c
 }
 
 func (p *Pacer) bwBytesPerSec() float64 {
-	if p.bw > 0 {
-		return p.bw
+	if bw := p.estBW(); bw > 0 {
+		return bw
 	}
 	// Nominal: the initial window per millisecond, so WakeAt moves.
 	return float64(10*p.mss) / 0.001
