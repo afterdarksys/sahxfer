@@ -29,7 +29,7 @@ The agent verifies the lease, then spawns `sahxfer recv --ctl-fd 3 --event-fd 4`
 
 Fd 3, agent to recv, one JSON object per line. The first line is the grant: `v` (1), `grant_id`, `transfer_id`, `purpose`, `dir`, `root`, `path`, `size`, `sha256`, `overwrite`, `profile`, `transport`, `aead`, `key`, `route_token`, `expires_unix` (first-packet deadline), `deadline_unix` (lease deadline), `idle_s`, `max_s`, `byte_cap`, `peer` (`listen:<ip:port>` to bind, port 0 for ephemeral, or `dial:<host:port>`). Unknown fields are refused; the line is capped at 64 KiB and then checked like any grant. The hard stop is the earlier of `deadline_unix - 60 + max_s` and now plus `max_s`. Later lines carry exactly the keys of their op: `{"op":"renew","deadline_unix":<n>}` and `{"op":"cancel","reason":"<code>"}` (`reason` optional). A deadline only moves forward; a renew that does not is refused with `{"ev":"refused","op":"renew","reason":"deadline_not_forward"}` on fd 4 and the old deadline stays. EOF is cancel with reason `stopped`. Any other line, or an extra key, stops the run with reason `protocol`. Fds 3 and 4 must be a pipe or a socket. recv waits at most 10 s for the grant line; a signal ends the wait at once.
 
-Fd 4, recv to agent: `{"ev":"ready","udp":"<bound addr>"}` (`udp` only when listening), `{"ev":"active","bytes":<n>}` on the first authentic packet and then at most once a second, and last `{"ev":"result","grant_id","transfer_id","status","reason","bytes","sha256","committed"}`. `status` is `ok`, `hash_mismatch`, `aborted`, `expired`, or `io_error`. `reason` is an ABORT name (§4.4), `stopped`, or, for a refusal before `ready`, the local code (`exists`, `symlink_refused`, `not_a_file`, `bad_path`, `no_space`). `sha256` is present only when `committed` is true. A commit is `ok` even if `CLOSE_ACK` never came. A grant line that does not arrive or does not decode produces one `{"ev":"result","status":"aborted","reason":"<code>","committed":false}`, without `grant_id` or `transfer_id`, and the code on stderr (`bad_grant` for a line that never came, `cancelled` for a signal).
+Fd 4, recv to agent: `{"ev":"ready","udp":"<bound addr>","rcvbuf":<n>}` (`udp` only when listening; `rcvbuf` is the granted `SO_RCVBUF` as `getsockopt` reports it, which on Linux is twice the usable size, `docs/design.md` §7.4), `{"ev":"active","bytes":<n>}` on the first authentic packet and then at most once a second, and last `{"ev":"result","grant_id","transfer_id","status","reason","bytes","sha256","committed"}`. `status` is `ok`, `hash_mismatch`, `aborted`, `expired`, or `io_error`. `reason` is an ABORT name (§4.4), `stopped`, or, for a refusal before `ready`, the local code (`exists`, `symlink_refused`, `not_a_file`, `bad_path`, `no_space`). `sha256` is present only when `committed` is true. A commit is `ok` even if `CLOSE_ACK` never came. A grant line that does not arrive or does not decode produces one `{"ev":"result","status":"aborted","reason":"<code>","committed":false}`, without `grant_id` or `transfer_id`, and the code on stderr (`bad_grant` for a line that never came, `cancelled` for a signal).
 
 A cancel, EOF, or lapsed lease sends one `ABORT cancelled` to the peer, deletes the temp, and reports the reason (`expired` for a lapsed lease). After the commit it sends nothing: the target is final, and the result is `ok`. Stdout and stderr are unchanged: three lines on success, one code on failure.
 
@@ -100,21 +100,22 @@ The route token is compared by SHA-256 of both sides, then a constant-time compa
 | `FIN` | 4 | Empty. `offset` is the file size. The sender has put every byte on the wire at least once. |
 | `DONE` | 5 | 32-byte SHA-256. `offset` is the file size. Sent only after fsync and rename. |
 | `ABORT` | 6 | One `u64` reason. |
-| `PING` | 7 | Empty. `offset` is the probe id. |
+| `PING` | 7 | Empty. `offset` is the probe id. Bit 62 of a receiver's probe id is `ZERO_OK` (§4.5). |
 | `PONG` | 8 | `u64 echo_send_time_ns`, `u64 receiver_delay_ns`. `offset` echoes the probe id. |
+| `ZERO` | 9 | One `u64 length`. `offset` is the file position. `[offset, offset+length)` is all zero bytes. Sent only to a receiver that set `ZERO_OK` (§4.5). |
 
-An unknown type on an authentic packet aborts with `protocol`.
+An unknown type on an authentic packet aborts with `protocol`. A receiver that did not set `ZERO_OK` treats `ZERO` as unknown.
 
 Flags:
 
 | Bit | Value | Name | Legal on |
 | --- | --- | --- | --- |
-| 0 | 1 | `RETX` | `DATA` only. This range is a retransmission. |
+| 0 | 1 | `RETX` | `DATA` and `ZERO`. This range is a retransmission. |
 | 1 | 2 | `CLOSE_ACK` | `FIN` only, and only after the sender has accepted a valid `DONE`. |
 
 Any other bit, or a legal bit on the wrong type, aborts with `protocol` after the packet opens.
 
-`offset + payload_len` uses a checked add. Wrap, or a span past `size`, aborts with `protocol` when the packet is authentic. `DATA` with length 0 aborts with `protocol` when `size` is greater than 0. An empty file has no `DATA`.
+`offset + payload_len` uses a checked add. Wrap, or a span past `size`, aborts with `protocol` when the packet is authentic. `DATA` with length 0 aborts with `protocol` when `size` is greater than 0. An empty file has no `DATA` and no `ZERO`. For `ZERO` the span is `offset + length`, under the same checks.
 
 ### 4.1 NACK
 
@@ -125,7 +126,7 @@ hole_count times:
     u64 end             // exclusive
 ```
 
-Holes are ordered, non-overlapping, and each `start < end <= size`. A hole is mature when a byte past its end has been accepted, or when it is older than `max(3 * srtt, 1 ms)` and any later sequence has been accepted. The trailing edge is not a hole. The receiver sends a NACK at least once per smoothed RTT while a mature hole exists, and again as soon as a hole becomes mature.
+Holes are ordered, non-overlapping, and each `start < end <= size`. A hole is mature when a byte past its end has been accepted, or when it is older than `max(3 * srtt, 1 ms)` and any later sequence has been accepted. The trailing edge is not a hole. A NACK whose `offset` is above the bytes the sender has sent once aborts with `protocol`: the receiver cannot hold a contiguous byte that never left. The receiver sends a NACK at least once per smoothed RTT while a mature hole exists, and again as soon as a hole becomes mature.
 
 ### 4.2 FEEDBACK
 
@@ -140,7 +141,7 @@ u64 ecn_ce_count
 u64 recv_rate_bps
 ```
 
-`offset` is the highest contiguous file byte, the same value as on a NACK. `highest_seq_received` is the highest `seq` of a `DATA` that added bytes the receiver did not hold; a duplicate does not raise it, and it never decreases. The sender's stall-probe undo depends on this. Cadence is `max(5 ms, srtt / 4)`, and at least every 64 accepted `DATA` packets. The sender retransmits on NACK, plus a stall probe. FEEDBACK does not request a retransmission.
+`offset` is the highest contiguous file byte, the same value as on a NACK, and above the bytes the sender has sent once it aborts with `protocol`. `highest_seq_received` is the highest `seq` of a `DATA` that added bytes the receiver did not hold; a duplicate does not raise it, and it never decreases. The sender's stall-probe undo depends on this. Cadence is `max(5 ms, srtt / 4)`, and at least every 64 accepted `DATA` packets. The sender retransmits on NACK, plus a stall probe. FEEDBACK does not request a retransmission.
 
 pace-bbr uses this sample. It runs on UDP. `quic-datagram` and `quic-bridge` turn inner pacing off, because QUIC already paces that hop.
 
@@ -179,15 +180,33 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 
 `ABORT` is best-effort. The grant is then dead. The receiver deletes the temp file. A later `DATA` for a dead grant is dropped.
 
+### 4.5 ZERO
+
+A run of zero bytes in the file travels as one `ZERO` frame instead of `DATA`. Offsets stay file offsets, the hole map and NACK are unchanged, and the hash is still SHA-256 of the whole file.
+
+Negotiation. The receiver sets bit 62 (`0x4000000000000000`, `ZERO_OK`) in the `offset` of every `PING` it sends. Probe ids are counters and never set bits 62 or 63 otherwise. A sender sends `ZERO` only after an authentic `PING` with `ZERO_OK`; until then, and always for a receiver that never sets it, zero bytes go as `DATA`. A sender ignores the bit on `PONG`. A v1 sender echoes the probe id in its `PONG` and does not read it, and a v1 receiver never sets it, so neither old peer sees a change. The datagram version stays 1.
+
+Payload, exactly 8 bytes:
+
+```
+u64 length      // 1 .. 1048576, and offset + length <= size
+```
+
+Receiver, after the packet opens: a payload other than 8 bytes, `length` 0, `length` above 1 MiB, a wrap, a span past `size`, `size` 0, or a receiver that did not set `ZERO_OK`: abort with `protocol`. Otherwise every byte of the span the hole map still lacks is made to read as zero (the temp file is extended to cover it, and the range may be deallocated, §5), the span is accepted into the hole map as `DATA` would be, and the streaming SHA-256 folds those zero bytes in order. `delivered_bytes`, `highest_seq_received`, the idle timer, `byte_cap`, and the `active` and `result` byte counts treat a `ZERO` exactly as `DATA` of `length` bytes. First write wins as for `DATA`.
+
+Sender. With `ZERO_OK`, each new block of `MSS` bytes at a multiple of `MSS` (the last block of the file may be shorter) is compared with zero before it is sealed. A zero block starts a run; following zero blocks extend it, up to `floor(1 MiB / MSS) * MSS` bytes or the end of the file. A run of at least `MSS` bytes is one `ZERO`. A run that is only a short final block is `DATA`. A repair reads its range again and uses `ZERO` for a zero prefix of at least `MSS` bytes or for the whole remaining range, otherwise `DATA`. A hole inside a zero run is repaired with `ZERO`. Either frame carries the same bytes at the same offset, so the one-plaintext rule (§5) holds.
+
+Charge. A `ZERO` costs the sender 88 bytes, its datagram, in the pacer and the in-flight cap, and a lost `ZERO` counts 88 bytes of loss. The pacer's delivery count, with `d = min(delivered_bytes, bytes sent once)` and `contig` the highest contiguous offset, is `(contig - Zb) + max(0, d - contig - Za)`: `Zb` is `length - 88` summed over the `ZERO`s sealed for the first time that lie wholly below `contig`, `Za` the same over the others. It is exact below `contig` and can only fall short above it, never exceed the wire bytes delivered, so neither a zero run nor a peer that reports more than the file can raise the bandwidth estimate.
+
 ## 5. Reliability
 
 The sender keeps the file. A retransmission reads the range again, seals it under a new sequence, and sets `RETX`. The plaintext at an offset is fixed for the life of the grant.
 
-The receiver writes the temp file with `pwrite`. The first write at an offset wins. A replay of the same bytes is a no-op. The streaming SHA-256 folds only the contiguous prefix. Out-of-order ranges sit in the file until the gap in front of them closes.
+The receiver writes the temp file with `pwrite`. A `ZERO` span is written as a hole: the temp file is extended with `ftruncate` when it is shorter than the span's end (never shrunk), then the block-aligned inside of the span is deallocated with `fallocate(PUNCH_HOLE|KEEP_SIZE)` on Linux or `F_PUNCHHOLE` on Darwin where the filesystem supports it, and nothing more elsewhere. The temp was created empty and a range the hole map lacks was never written, so it reads as zero once the file covers it. The first write at an offset wins. A replay of the same bytes is a no-op. The streaming SHA-256 folds only the contiguous prefix. Out-of-order ranges sit in the file until the gap in front of them closes.
 
 The hole map starts as `[0, size)`. It holds missing ranges, not file bytes.
 
-`byte_cap` counts unique file bytes sealed for the first time and unique bytes accepted. A retransmission does not add to the cap. Exceeding the cap aborts with `byte_cap`.
+`byte_cap` counts unique file bytes sealed for the first time and unique bytes accepted, a `ZERO` by its `length`. A retransmission does not add to the cap. Exceeding the cap aborts with `byte_cap`. The relay charges a `ZERO` its 88 bytes against its control budget (§6).
 
 Commit order on the receiver: hole map empty, streamed SHA-256 equals the grant, `fsync` the temp file, `fsync` the parent directory, then rename. `DONE` is sent after that. A hash mismatch deletes the temp and does not rename. `overwrite` false uses `renameat2(RENAME_NOREPLACE)`. The temp name is `.sahxfer-<grant_id>.part`, created `O_CREAT|O_EXCL|O_NOFOLLOW|O_RDWR`, mode 0600.
 
@@ -195,11 +214,11 @@ Linux opens the root and the path with `openat2` (`RESOLVE_BENEATH`, no symlinks
 
 ## 6. Relay
 
-The default path is a relay that does not have the key. Both peers send UDP to it. Direct UDP is used only when policy says the host published a reachable address. Hole punching is out of v1.
+The default path is a relay that does not have the key. Both peers send UDP to it. Direct UDP is used only when policy says the host published a reachable address. NAT hole punching is out of v1.
 
 On a packet the relay checks magic and version, requires at least 80 bytes, looks up `transfer_id`, and compares the route token as in section 3. The first source 4-tuple in each direction is pinned. A different source is dropped. A third peer cannot join. The datagram is forwarded unchanged. When the other peer is not pinned yet, the relay holds one datagram for 1 second.
 
-The 32nd token mismatch forgets the grant and reports `auth`. The forwarding cap is the grant's byte cap. The relay does not log the route token, rewrite sequence or offset, or fragment.
+The 32nd token mismatch forgets the grant and reports `auth`. The forwarding cap is the grant's byte cap, charged with `DATA` payload. Every other datagram, `ZERO` included, is charged its whole length against a second budget of `byte_cap + 256 MiB`; past either, the relay forgets the grant and reports `byte_cap`. The relay does not log the route token, rewrite sequence or offset, or fragment.
 
 ## 7. QUIC
 
@@ -223,6 +242,7 @@ A sealed internet frame is 1232 bytes. `quic-datagram` on the `dc` cap (8192) do
 | Hard max | 3600 s |
 | Auth failures | 32 per counter |
 | NACK holes | 32 |
+| `ZERO` length | 1 MiB |
 | Relay hold | 1 datagram, 1 s |
 | Bridge queue | 4 MiB, UDP-bound bytes for that grant |
 
@@ -230,4 +250,4 @@ A limit breach aborts. It does not truncate and commit.
 
 ## 9. Out of v1
 
-Directories, delete, rsync deltas, more than one file per grant, resume, hole punching, `crypto=off`, 0-RTT, a decrypting bridge, `O_DIRECT`, `sendfile`, `splice`, and `mmap` of the fast path. If UDP and QUIC are both blocked, the transfer fails. The operator uses `sahsync`.
+Directories, delete, rsync deltas, more than one file per grant, resume, NAT hole punching, `crypto=off`, 0-RTT, a decrypting bridge, `O_DIRECT`, `sendfile`, `splice`, and `mmap` of the fast path. If UDP and QUIC are both blocked, the transfer fails. The operator uses `sahsync`.

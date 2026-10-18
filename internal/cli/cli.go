@@ -59,11 +59,11 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "grant":
 		return cmdGrant(args[1:], stdout)
 	case "put":
-		return cmdPut(ctx, args[1:], stdout)
+		return cmdPut(ctx, args[1:], stdout, stderr)
 	case "get":
-		return cmdGet(ctx, args[1:], stdout)
+		return cmdGet(ctx, args[1:], stdout, stderr)
 	case "recv":
-		return cmdRecv(ctx, args[1:], stdout)
+		return cmdRecv(ctx, args[1:], stdout, stderr)
 	case "relay":
 		return cmdRelay(ctx, args[1:], stderr)
 	default:

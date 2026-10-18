@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -33,10 +34,31 @@ type side struct {
 	// for Committed and Delivered. Both may be nil.
 	progress func(uint64)
 	done     func(*engine.Peer)
+	// rcvbuf and sndbuf are the granted socket buffers when the caller
+	// already tuned conn (agent mode reports rcvbuf in ready); 0 and 0
+	// means transfer tunes it.
+	rcvbuf, sndbuf int
 }
 
-func cmdPut(ctx context.Context, args []string, stdout io.Writer) error {
+type diagKey struct{}
+
+// withDiag carries the --diag stderr writer to transfer. Without --diag
+// stderr stays a code (docs/design.md section 7.4).
+func withDiag(ctx context.Context, on bool, w io.Writer) context.Context {
+	if !on || w == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, diagKey{}, w)
+}
+
+func diagFrom(ctx context.Context) io.Writer {
+	w, _ := ctx.Value(diagKey{}).(io.Writer)
+	return w
+}
+
+func cmdPut(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	c := newCmd()
+	diag := c.set.Bool("diag", false, "")
 	gpath := c.set.String("grant", "", "")
 	base := c.set.String("url", "", "")
 	root := c.set.String("root", "", "")
@@ -47,6 +69,7 @@ func cmdPut(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := c.parse(args); err != nil {
 		return err
 	}
+	ctx = withDiag(ctx, *diag, stderr)
 	if c.saw("grant") && c.saw("url") {
 		return code.New("bad_args")
 	}
@@ -81,8 +104,9 @@ func cmdPut(ctx context.Context, args []string, stdout io.Writer) error {
 	return code.New("bad_args")
 }
 
-func cmdGet(ctx context.Context, args []string, stdout io.Writer) error {
+func cmdGet(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	c := newCmd()
+	diag := c.set.Bool("diag", false, "")
 	gpath := c.set.String("grant", "", "")
 	base := c.set.String("url", "", "")
 	root := c.set.String("root", "", "")
@@ -95,6 +119,7 @@ func cmdGet(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := c.parse(args); err != nil {
 		return err
 	}
+	ctx = withDiag(ctx, *diag, stderr)
 	if c.saw("grant") && c.saw("url") {
 		return code.New("bad_args")
 	}
@@ -132,8 +157,9 @@ func cmdGet(ctx context.Context, args []string, stdout io.Writer) error {
 	return code.New("bad_args")
 }
 
-func cmdRecv(ctx context.Context, args []string, stdout io.Writer) error {
+func cmdRecv(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	c := newCmd()
+	diag := c.set.Bool("diag", false, "")
 	gpath := c.set.String("grant", "", "")
 	listen := c.set.String("listen", "", "")
 	to := c.set.String("to", "", "")
@@ -145,6 +171,7 @@ func cmdRecv(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := c.parse(args); err != nil {
 		return err
 	}
+	ctx = withDiag(ctx, *diag, stderr)
 	fileMode := c.saw("grant") || c.saw("listen") || c.saw("to") || c.saw("root")
 	if c.saw("sweep") {
 		// --report, and only --report, takes an event fd.
@@ -528,7 +555,16 @@ func transfer(ctx context.Context, s side) error {
 		p.AttachDest(s.dest)
 	}
 	ran = true
-	err = udp.Run(ctx, udp.Config{Peer: p, Conn: s.conn, Connected: s.connected, Epoch: 0, Progress: s.progress})
+	rcv, snd := s.rcvbuf, s.sndbuf
+	if rcv == 0 && snd == 0 {
+		rcv, snd = udp.TuneBuffers(s.conn, udp.WantBuffer)
+	}
+	var diag func(string)
+	if w := diagFrom(ctx); w != nil {
+		fmt.Fprintf(w, "diag rcvbuf=%d sndbuf=%d\n", rcv, snd)
+		diag = func(line string) { fmt.Fprintln(w, line) }
+	}
+	err = udp.Run(ctx, udp.Config{Peer: p, Conn: s.conn, Connected: s.connected, Epoch: 0, Progress: s.progress, RcvBuf: rcv, Diag: diag})
 	if s.done != nil {
 		s.done(p)
 	}

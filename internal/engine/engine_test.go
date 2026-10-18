@@ -52,6 +52,8 @@ type pair struct {
 	s, r                      *Peer
 	src, dst                  *memFile
 	commits, cleansS, cleansR int
+	// step, when set, runs after each runUntil step.
+	step func()
 }
 
 func newPair(t *testing.T, file []byte, mss uint64, alter func(s, r *Config)) *pair {
@@ -219,6 +221,9 @@ func runUntil(pr *pair, ab, ba *pipe, limit time.Duration) (time.Duration, error
 		sd, rd := pr.s.Take(), pr.r.Take()
 		ab.send(now, sd)
 		ba.send(now, rd)
+		if pr.step != nil {
+			pr.step()
+		}
 		// Report the time both finished, not the next wake (now + Max).
 		if pr.s.OK() && pr.r.OK() {
 			return now, nil

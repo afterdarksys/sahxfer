@@ -87,8 +87,30 @@ func TestFlags(t *testing.T) {
 	if FlagsOK(TypeNACK, FlagRETX) || !FlagsOK(TypePING, 0) {
 		t.Fatal("control flags")
 	}
-	if KnownType(0) || KnownType(9) || !KnownType(TypePONG) {
+	if KnownType(0) || KnownType(10) || !KnownType(TypePONG) || !KnownType(TypeZERO) {
 		t.Fatal("types")
+	}
+	if !FlagsOK(TypeZERO, FlagRETX) || FlagsOK(TypeZERO, FlagCloseAck) || FlagsOK(TypeZERO, 1<<2) {
+		t.Fatal("zero flags")
+	}
+}
+
+func TestZeroCodec(t *testing.T) {
+	n, err := DecodeZero(EncodeZero(MaxZero))
+	if err != nil || n != MaxZero {
+		t.Fatal(n, err)
+	}
+	if _, err := DecodeZero(EncodeZero(0)); err != ErrPayload {
+		t.Fatal("zero length accepted")
+	}
+	if _, err := DecodeZero(EncodeZero(MaxZero + 1)); err != ErrPayload {
+		t.Fatal("length above MaxZero accepted")
+	}
+	if _, err := DecodeZero(make([]byte, 16)); err != ErrPayload {
+		t.Fatal("16-byte payload accepted")
+	}
+	if ZeroWire != 88 || ZeroOK != 1<<62 {
+		t.Fatal(ZeroWire, ZeroOK)
 	}
 }
 

@@ -208,6 +208,9 @@ func TestRecvAgentPut(t *testing.T) {
 	if ready["ev"] != "ready" || !strings.HasPrefix(addr, "127.0.0.1:") || strings.HasSuffix(addr, ":0") {
 		t.Fatalf("ready %v", ready)
 	}
+	if rb, _ := ready["rcvbuf"].(float64); rb <= 0 {
+		t.Fatalf("ready without rcvbuf: %v", ready)
+	}
 	tx := sendFrom(t, ctx, g, body, addr, false)
 	active := a.next(t)
 	if active["ev"] != "active" {

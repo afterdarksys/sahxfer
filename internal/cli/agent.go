@@ -33,6 +33,7 @@ import (
 	"github.com/afterdarksys/sahxfer/internal/frame"
 	"github.com/afterdarksys/sahxfer/internal/grant"
 	"github.com/afterdarksys/sahxfer/internal/safeio"
+	"github.com/afterdarksys/sahxfer/internal/udp"
 )
 
 // stopErr is why the agent-mode run was stopped from outside the engine.
@@ -62,6 +63,7 @@ type event struct {
 	Ev         string  `json:"ev"`
 	Op         string  `json:"op,omitempty"`
 	UDP        string  `json:"udp,omitempty"`
+	Rcvbuf     *int    `json:"rcvbuf,omitempty"`
 	Bytes      *uint64 `json:"bytes,omitempty"`
 	GrantID    string  `json:"grant_id,omitempty"`
 	TransferID string  `json:"transfer_id,omitempty"`
@@ -206,7 +208,8 @@ func recvAgentRun(ctx context.Context, ag *grant.AgentGrant, em *emitter, done f
 		return err
 	}
 	defer conn.Close()
-	ready := event{Ev: "ready"}
+	rcv, snd := udp.TuneBuffers(conn, udp.WantBuffer)
+	ready := event{Ev: "ready", Rcvbuf: &rcv}
 	if listen {
 		ready.UDP = conn.LocalAddr().String()
 	}
@@ -214,6 +217,7 @@ func recvAgentRun(ctx context.Context, ag *grant.AgentGrant, em *emitter, done f
 	s := side{
 		g: g, role: "agent", sender: sender,
 		conn: conn, connected: connected,
+		rcvbuf: rcv, sndbuf: snd,
 		progress: func(n uint64) { em.emit(event{Ev: "active", Bytes: &n}) },
 		done:     done,
 	}

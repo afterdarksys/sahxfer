@@ -33,6 +33,15 @@ const (
 	HashLen      = 32
 	PongLen      = 16
 	AbortLen     = 8
+	ZeroLen      = 8
+
+	// MaxZero is the largest span one ZERO may name (1 MiB). Each side
+	// hashes a ZERO's bytes, so this bounds the work one datagram costs.
+	MaxZero = 1 << 20
+	// ZeroOK is bit 62 of a receiver's PING offset: it accepts ZERO.
+	ZeroOK uint64 = 1 << 62
+	// ZeroWire is a ZERO datagram's length, which is what it is charged.
+	ZeroWire = Overhead + ZeroLen
 )
 
 const (
@@ -44,6 +53,7 @@ const (
 	TypeABORT    uint8 = 6
 	TypePING     uint8 = 7
 	TypePONG     uint8 = 8
+	TypeZERO     uint8 = 9
 )
 
 const (
@@ -161,15 +171,16 @@ func LengthOK(b []byte, h Header) bool {
 	return ok && len(b) == n
 }
 
-// KnownType reports whether t is a v1 type.
+// KnownType reports whether t is a v1 type. ZERO is known here; a
+// receiver that did not set ZeroOK refuses it as protocol.
 func KnownType(t uint8) bool {
-	return t >= TypeDATA && t <= TypePONG
+	return t >= TypeDATA && t <= TypeZERO
 }
 
 // FlagsOK reports whether flags are legal on typ.
 func FlagsOK(typ uint8, flags uint16) bool {
 	switch typ {
-	case TypeDATA:
+	case TypeDATA, TypeZERO:
 		return flags&^FlagRETX == 0
 	case TypeFIN:
 		return flags&^FlagCloseAck == 0
@@ -296,6 +307,26 @@ func DecodePong(pt []byte) (echo, delay uint64, err error) {
 		return 0, 0, ErrPayload
 	}
 	return binary.LittleEndian.Uint64(pt[0:8]), binary.LittleEndian.Uint64(pt[8:16]), nil
+}
+
+// EncodeZero encodes the ZERO length.
+func EncodeZero(length uint64) []byte {
+	buf := make([]byte, ZeroLen)
+	binary.LittleEndian.PutUint64(buf, length)
+	return buf
+}
+
+// DecodeZero rejects any payload other than 8 bytes and a length of 0 or
+// above MaxZero. The caller checks offset+length against the file size.
+func DecodeZero(pt []byte) (uint64, error) {
+	if len(pt) != ZeroLen {
+		return 0, ErrPayload
+	}
+	n := binary.LittleEndian.Uint64(pt)
+	if n == 0 || n > MaxZero {
+		return 0, ErrPayload
+	}
+	return n, nil
 }
 
 // EncodeAbort encodes one reason.

@@ -222,7 +222,7 @@ func TestChargeAndCap(t *testing.T) {
 	}
 	r.Handle(0, "A", pkt(2, 4, frame.TypeNACK, 0, 8, good))
 	r.Handle(0, "B", pkt(2, 5, frame.TypePING, 0, 0, good))
-	if r.flows[2].used != 5 {
+	if r.flows[2].used != 5 || r.flows[2].ctl != 4*frame.Overhead+8 {
 		t.Fatalf("control counted: %d", r.flows[2].used)
 	}
 
@@ -253,6 +253,31 @@ func TestChargeAndCap(t *testing.T) {
 	_, rep, _ = r.Handle(0, "A", pkt(3, 1, frame.TypeDATA, 0, 1, good))
 	if rep != "byte_cap" || strings.Contains(rep, ascii) {
 		t.Fatalf("cap 0: %q", rep)
+	}
+}
+
+// Non-DATA datagrams, ZERO included, are charged their whole length
+// against byte_cap + CtlAllowance; the DATA budget is untouched.
+func TestControlBudget(t *testing.T) {
+	good := tok('z')
+	r := New()
+	admit(t, r, 4, good, 1000)
+	r.Handle(0, "A", pkt(4, 1, frame.TypePING, 0, 0, good))
+	r.Handle(0, "B", pkt(4, 2, frame.TypePING, 0, 0, good))
+	outs, rep, _ := r.Handle(0, "A", pkt(4, 3, frame.TypeZERO, 0, frame.ZeroLen, good))
+	if rep != "" || len(outs) != 1 || r.flows[4].used != 0 || r.flows[4].ctl != 2*frame.Overhead+frame.ZeroWire {
+		t.Fatalf("zero: rep=%q used=%d ctl=%d", rep, r.flows[4].used, r.flows[4].ctl)
+	}
+	r.flows[4].ctl = 1000 + CtlAllowance - frame.ZeroWire
+	if _, rep, _ := r.Handle(0, "A", pkt(4, 4, frame.TypeZERO, 0, frame.ZeroLen, good)); rep != "" {
+		t.Fatalf("exactly at the budget: %q", rep)
+	}
+	outs, rep, id := r.Handle(0, "A", pkt(4, 5, frame.TypeZERO, 0, frame.ZeroLen, good))
+	if rep != "byte_cap" || outs != nil || id != 4 {
+		t.Fatalf("over the budget: rep=%q outs=%v", rep, outs)
+	}
+	if _, ok := r.flows[4]; ok {
+		t.Fatal("not forgotten")
 	}
 }
 
@@ -293,8 +318,8 @@ func TestChargeWrap(t *testing.T) {
 	if f.used != ^uint64(0)-10 {
 		t.Fatalf("wrap added: %d", f.used)
 	}
-	if f.charge(frame.Header{Type: frame.TypePING, PayloadLen: 11}) {
-		t.Fatal("ping charged")
+	if f.charge(frame.Header{Type: frame.TypePING, PayloadLen: 11}) || f.ctl != frame.Overhead+11 {
+		t.Fatalf("ping tripped or not charged: ctl %d", f.ctl)
 	}
 	r := New()
 	good := tok(8)

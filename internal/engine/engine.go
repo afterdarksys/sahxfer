@@ -12,17 +12,20 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"hash"
 	"io"
+	"os"
 	"sort"
 	"time"
 
 	"github.com/afterdarksys/sahxfer/internal/cc"
 	"github.com/afterdarksys/sahxfer/internal/frame"
 	"github.com/afterdarksys/sahxfer/internal/hole"
+	"github.com/afterdarksys/sahxfer/internal/safeio"
 	"github.com/afterdarksys/sahxfer/internal/seal"
 )
 
@@ -76,6 +79,9 @@ type Config struct {
 	ByteCap     uint64
 	ExpectHash  [32]byte
 	HaveHash    bool
+	// NoZero makes this peer a v1 peer for ZERO: a receiver does not set
+	// ZERO_OK and refuses ZERO; a sender never sends it (section 4.7).
+	NoZero bool
 }
 
 // Hooks run around commit. Commit is fsync plus rename. Cleanup deletes
@@ -90,6 +96,14 @@ type Hooks struct {
 type File interface {
 	io.ReaderAt
 	io.WriterAt
+}
+
+// Zeroer is an optional File method: make a never-written range read as
+// zero, extending the file to cover it. An *os.File uses safeio.ZeroRange
+// (ftruncate, then a hole punch where the platform has one). Any other
+// File gets one zero byte written at the end of the range.
+type Zeroer interface {
+	ZeroRange(off, n int64) error
 }
 
 // Peer is one side of a transfer.
@@ -173,6 +187,49 @@ type Peer struct {
 	doneSent    bool
 	hashedTo    uint64
 	doneSum     []byte
+	hashBuf     []byte
+
+	// peerZero: the receiver set ZERO_OK on an authentic PING.
+	peerZero bool
+	// zeroBelow is length-ZeroWire summed over the ZEROs sealed for the
+	// first time that lie wholly below contig; zeroAbove holds the rest.
+	// The pacer's delivery count takes both off (section 4.7).
+	zeroBelow  uint64
+	zeroAbove  []frame.Span
+	zeroAboveX uint64
+	zeroFrames uint64
+	zeroBytes  uint64
+	// pend is the classified next new frame, kept while the pacer holds
+	// it so a zero scan is not repeated on every Pump.
+	pend    pendFrame
+	hasPend bool
+
+	// rxWire is the bytes of authentic datagrams received; minRTT is the
+	// least RTT sample. RecvRate reports them for the socket-buffer check.
+	rxWire  uint64
+	minRTT  time.Duration
+	scanBuf []byte
+}
+
+// pendFrame is one classified frame: DATA with its bytes, or a ZERO span.
+type pendFrame struct {
+	sp   frame.Span
+	zero bool
+	buf  []byte
+	// deferred: the head block is zero but datagrams sealed in this Pump
+	// are waiting; nothing was scanned or sent.
+	deferred bool
+}
+
+// zeroCharge is what a ZERO costs in the pacer, the in-flight cap,
+// delivery, and loss: its datagram (section 4.7).
+func zeroCharge(uint64) uint64 { return frame.ZeroWire }
+
+func (f pendFrame) charge() uint64 {
+	if f.zero {
+		return zeroCharge(f.sp.End - f.sp.Start)
+	}
+	return f.sp.End - f.sp.Start
 }
 
 // stallUndo records a range probe that may prove spurious.
@@ -183,11 +240,14 @@ type stallUndo struct {
 	snap cc.LossState // controller loss state before the probe
 }
 
+// sentSeg is one sealed DATA or ZERO. n is its charge: the payload for
+// DATA, zeroCharge for ZERO.
 type sentSeg struct {
 	start, end uint64
 	n          uint64
 	at         time.Duration
 	retx       bool
+	zero       bool
 }
 
 // New checks the grant shape and opens the AEAD session.
@@ -326,6 +386,7 @@ func (p *Peer) Pump(now time.Duration) {
 	p.maybeRePing(now)
 	p.maybeNACK(now)
 	p.maybeFeedback(now)
+	p.foldHash(now, foldSlack)
 	p.maybeVerify(now)
 	if p.committed && !p.gotClose {
 		p.maybeDONE(now)
@@ -376,12 +437,15 @@ func (p *Peer) recv(now time.Duration, dgram []byte, pinned bool) bool {
 	if !p.sawPeer {
 		p.firstRx = now
 	}
+	p.rxWire += uint64(len(dgram))
 	p.sawPeer = true
 	p.lastRx = now
 	p.lastProgress = now
 	switch h.Type {
 	case frame.TypeDATA:
 		p.onData(now, h, pt)
+	case frame.TypeZERO:
+		p.onZero(now, h, pt)
 	case frame.TypeNACK:
 		p.onNACK(now, h, pt)
 	case frame.TypeFEEDBACK:
@@ -432,6 +496,11 @@ func (p *Peer) WakeAt(now time.Duration) time.Duration {
 		if w := p.pacer.WakeAt(now); w > now {
 			consider(w)
 		}
+	}
+	if !p.cfg.Sender && p.dest != nil && p.hashedTo < p.holes.Contiguous() {
+		// The hash lags (foldHash): fold more on the next Pump, without
+		// skipping the FEEDBACK and NACK timers below.
+		consider(now + time.Microsecond)
 	}
 	if !p.sawPeer {
 		consider(p.start + p.cfg.FirstPacket)
@@ -514,6 +583,24 @@ func (p *Peer) Close() {
 	p.sess.Wipe()
 	p.sess = nil
 }
+
+// RecvRate is the receiver's arrival rate in wire bytes per second since
+// its first authentic datagram, and its least RTT sample (srtt before one).
+// A sender, or a receiver that has heard nothing, reports 0.
+func (p *Peer) RecvRate(now time.Duration) (float64, time.Duration) {
+	if p.cfg.Sender || !p.sawPeer || now <= p.firstRx {
+		return 0, 0
+	}
+	rtt := p.minRTT
+	if rtt == 0 {
+		rtt = p.srtt
+	}
+	return float64(p.rxWire) / (now - p.firstRx).Seconds(), rtt
+}
+
+// ZeroStats is the ZERO frames this sender sealed for the first time and
+// the file bytes they carried.
+func (p *Peer) ZeroStats() (frames, bytes uint64) { return p.zeroFrames, p.zeroBytes }
 
 // Delivered is unique file bytes accepted (receiver) or acknowledged (sender).
 func (p *Peer) Delivered() uint64 {
@@ -602,6 +689,9 @@ func (p *Peer) noteRTT(rtt, now time.Duration) {
 	if rtt <= 0 {
 		return
 	}
+	if p.minRTT == 0 || rtt < p.minRTT {
+		p.minRTT = rtt
+	}
 	// RFC 6298: rttvar from the previous srtt, then srtt.
 	if !p.haveRTT {
 		p.srtt = rtt
@@ -622,7 +712,11 @@ func (p *Peer) noteRTT(rtt, now time.Duration) {
 
 func (p *Peer) emitPing(now time.Duration) {
 	p.probe++
-	p.send(now, frame.Header{Type: frame.TypePING, Offset: p.probe}, nil)
+	off := p.probe
+	if !p.cfg.Sender && !p.cfg.NoZero {
+		off |= frame.ZeroOK
+	}
+	p.send(now, frame.Header{Type: frame.TypePING, Offset: off}, nil)
 	p.pings++
 	p.lastPing = now
 }
@@ -674,52 +768,87 @@ func (p *Peer) sendData(now time.Duration) {
 		p.pacer.SetAppLimited(p.nextNew >= p.cfg.Size)
 	}
 	for {
-		sp, retx, ok := p.nextSpan()
-		if !ok || (!retx && p.holdNew) {
+		retx := len(p.retx) > 0
+		if !retx && (p.nextNew >= p.cfg.Size || p.holdNew) {
 			return
 		}
-		n := sp.End - sp.Start
-		if p.pacer != nil && !p.pacer.CanSend(now, n) && !(retx && p.pacer.CanRepair(now, n)) {
-			if retx {
-				p.retx = append([]frame.Span{sp}, p.retx...)
-			}
+		// Nothing can leave before the pacer's next slot: do not read.
+		if p.pacer != nil && !p.pacer.CanSend(now, 1) && !(retx && p.pacer.CanRepair(now, 1)) {
 			return
 		}
 		if p.pacer == nil && p.unpaced {
-			if retx {
-				p.retx = append([]frame.Span{sp}, p.retx...)
-			}
 			return
 		}
-		if !retx && p.nextNew+n > p.cfg.ByteCap {
+		var f pendFrame
+		var err error
+		if retx {
+			f, err = p.classify(p.retx[0], true)
+		} else if p.hasPend && p.pend.sp.Start == p.nextNew {
+			f = p.pend
+		} else {
+			f, err = p.classify(frame.Span{Start: p.nextNew, End: p.cfg.Size}, false)
+			p.pend, p.hasPend = f, err == nil && !f.deferred
+		}
+		if err != nil {
+			p.abort(now, frame.ReasonIO)
+			return
+		}
+		if f.deferred {
+			// classify stopped at a zero block: let what is sealed leave.
+			return
+		}
+		n := f.charge()
+		if p.pacer != nil && !p.pacer.CanSend(now, n) && !(retx && p.pacer.CanRepair(now, n)) {
+			return
+		}
+		if !retx && f.sp.End > p.cfg.ByteCap {
 			p.abort(now, frame.ReasonByteCap)
 			return
 		}
-		buf := make([]byte, n)
-		if _, err := p.src.ReadAt(buf, int64(sp.Start)); err != nil {
-			p.abort(now, frame.ReasonIO)
-			return
+		if retx {
+			if f.sp.End < p.retx[0].End {
+				p.retx[0].Start = f.sp.End
+			} else {
+				p.retx = p.retx[1:]
+			}
+		} else {
+			p.hasPend = false
 		}
 		flags := uint16(0)
 		if retx {
 			flags = frame.FlagRETX
 		}
-		if !p.send(now, frame.Header{Type: frame.TypeDATA, Flags: flags, Offset: sp.Start}, buf) {
+		h := frame.Header{Type: frame.TypeDATA, Flags: flags, Offset: f.sp.Start}
+		pt := f.buf
+		if f.zero {
+			h.Type = frame.TypeZERO
+			pt = frame.EncodeZero(f.sp.End - f.sp.Start)
+		}
+		if !p.send(now, h, pt) {
 			p.abort(now, frame.ReasonProtocol)
 			return
 		}
-		p.inflight = append(p.inflight, sentSeg{start: sp.Start, end: sp.End, n: n, at: now, retx: retx})
+		p.inflight = append(p.inflight, sentSeg{start: f.sp.Start, end: f.sp.End, n: n, at: now, retx: retx, zero: f.zero})
 		if p.pacer != nil {
 			p.pacer.OnSend(n, now)
 		} else {
 			p.unpaced = true
 		}
 		if !retx {
-			if _, err := p.hash.Write(buf); err != nil {
+			if f.zero {
+				if err := hashZeros(p.hash, f.sp.End-f.sp.Start); err != nil {
+					p.abort(now, frame.ReasonIO)
+					return
+				}
+				p.zeroAbove = append(p.zeroAbove, f.sp)
+				p.zeroAboveX += f.sp.End - f.sp.Start - zeroCharge(f.sp.End-f.sp.Start)
+				p.zeroFrames++
+				p.zeroBytes += f.sp.End - f.sp.Start
+			} else if _, err := p.hash.Write(f.buf); err != nil {
 				p.abort(now, frame.ReasonIO)
 				return
 			}
-			p.nextNew = sp.End
+			p.nextNew = f.sp.End
 			if p.nextNew == p.cfg.Size && p.state == stSending {
 				p.enterFlush(now)
 			}
@@ -727,26 +856,109 @@ func (p *Peer) sendData(now time.Duration) {
 	}
 }
 
-func (p *Peer) nextSpan() (frame.Span, bool, bool) {
+// classify reads the head of sp and picks its frame (section 4.7). The
+// first MSS bytes are read; without ZERO_OK, or if they are not all zero,
+// they are a DATA. Otherwise the zero run is extended block by block up
+// to the ZERO cap and sp.End. New bytes (sp.End is the file size) need a
+// run of at least MSS; a repair also takes a run that reaches sp.End.
+func (p *Peer) classify(sp frame.Span, retx bool) (pendFrame, error) {
 	mss := p.cfg.MSS
-	if len(p.retx) > 0 {
-		sp := p.retx[0]
-		p.retx = p.retx[1:]
-		if sp.End-sp.Start > mss {
-			rest := frame.Span{Start: sp.Start + mss, End: sp.End}
-			sp.End = sp.Start + mss
-			p.retx = append([]frame.Span{rest}, p.retx...)
+	end := sp.End
+	if end-sp.Start > mss {
+		end = sp.Start + mss
+	}
+	buf := make([]byte, end-sp.Start)
+	if _, err := p.src.ReadAt(buf, int64(sp.Start)); err != nil {
+		return pendFrame{}, err
+	}
+	data := pendFrame{sp: frame.Span{Start: sp.Start, End: end}, buf: buf}
+	if !p.peerZero || p.cfg.NoZero || !allZero(buf) {
+		return data, nil
+	}
+	// A ZERO costs up to MaxZero of reading and hashing. At most one per
+	// Pump, and none while a datagram sealed in this Pump (a PONG, a FIN, a
+	// DATA) waits: a PONG held behind that work inflates the peer's RTT
+	// sample, and with it its FEEDBACK interval (docs/design.md 4.7).
+	if len(p.out) > 0 {
+		return pendFrame{deferred: true}, nil
+	}
+	limit := sp.End
+	if c := sp.Start + frame.MaxZero/mss*mss; c < limit {
+		limit = c
+	}
+	zend, err := p.zeroRun(end, limit)
+	if err != nil {
+		return pendFrame{}, err
+	}
+	if zend-sp.Start >= mss || (retx && zend == sp.End) {
+		return pendFrame{sp: frame.Span{Start: sp.Start, End: zend}, zero: true}, nil
+	}
+	return data, nil
+}
+
+// zeroRun reads from at, in blocks of MSS (the last may end at limit),
+// and returns the end of the leading all-zero blocks.
+func (p *Peer) zeroRun(at, limit uint64) (uint64, error) {
+	mss := p.cfg.MSS
+	chunk := (64 << 10) / mss * mss
+	if chunk < mss {
+		chunk = mss
+	}
+	if uint64(len(p.scanBuf)) < chunk {
+		p.scanBuf = make([]byte, chunk)
+	}
+	for at < limit {
+		n := limit - at
+		if n > chunk {
+			n = chunk
 		}
-		return sp, true, true
+		b := p.scanBuf[:n]
+		if _, err := p.src.ReadAt(b, int64(at)); err != nil {
+			return 0, err
+		}
+		for len(b) > 0 {
+			k := uint64(len(b))
+			if k > mss {
+				k = mss
+			}
+			if !allZero(b[:k]) {
+				return at, nil
+			}
+			at += k
+			b = b[k:]
+		}
 	}
-	if p.nextNew >= p.cfg.Size {
-		return frame.Span{}, false, false
+	return at, nil
+}
+
+var zeros [64 << 10]byte
+
+func allZero(b []byte) bool {
+	for len(b) > 0 {
+		n := len(b)
+		if n > len(zeros) {
+			n = len(zeros)
+		}
+		if !bytes.Equal(b[:n], zeros[:n]) {
+			return false
+		}
+		b = b[n:]
 	}
-	n := p.cfg.Size - p.nextNew
-	if n > mss {
-		n = mss
+	return true
+}
+
+func hashZeros(h hash.Hash, n uint64) error {
+	for n > 0 {
+		k := n
+		if k > uint64(len(zeros)) {
+			k = uint64(len(zeros))
+		}
+		if _, err := h.Write(zeros[:k]); err != nil {
+			return err
+		}
+		n -= k
 	}
-	return frame.Span{Start: p.nextNew, End: p.nextNew + n}, false, true
+	return nil
 }
 
 func (p *Peer) enterFlush(now time.Duration) {
@@ -845,7 +1057,12 @@ func (p *Peer) maybeStall(now time.Duration) {
 		}
 		sp := frame.Span{Start: s.start, End: s.end}
 		if p.queueRetx(sp, now) {
-			lost += sp.End - sp.Start
+			// A lost ZERO is its 88-byte datagram, not its length.
+			if s.zero {
+				lost += s.n
+			} else {
+				lost += sp.End - sp.Start
+			}
 			release[i] = true
 		} else if p.queued(sp) {
 			release[i] = true
@@ -972,6 +1189,17 @@ func (p *Peer) noteContig(c uint64, now time.Duration) {
 	}
 	p.inflight = keep
 	p.contig = c
+	zk := p.zeroAbove[:0]
+	for _, z := range p.zeroAbove {
+		if z.End <= c {
+			x := z.End - z.Start - zeroCharge(z.End-z.Start)
+			p.zeroBelow += x
+			p.zeroAboveX -= x
+			continue
+		}
+		zk = append(zk, z)
+	}
+	p.zeroAbove = zk
 	if p.pacer != nil && filled > 0 {
 		p.pacer.OnFilled(filled, now)
 	}
@@ -1006,6 +1234,52 @@ func (p *Peer) onData(now time.Duration, h frame.Header, pt []byte) {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
+	p.accept(now, h, end, func(lo, hi uint64) error {
+		_, err := p.dest.WriteAt(pt[lo-h.Offset:hi-h.Offset], int64(lo))
+		return err
+	})
+}
+
+// onZero applies a ZERO (section 4.7): the span the hole map lacks is made
+// to read as zero, then accepted exactly as DATA of that length.
+func (p *Peer) onZero(now time.Duration, h frame.Header, pt []byte) {
+	if p.cfg.Sender || p.state == stDone {
+		return
+	}
+	if p.cfg.NoZero || p.cfg.Size == 0 {
+		p.abort(now, frame.ReasonProtocol)
+		return
+	}
+	n, err := frame.DecodeZero(pt)
+	if err != nil {
+		p.abort(now, frame.ReasonProtocol)
+		return
+	}
+	end, ok := add(h.Offset, n)
+	if !ok || end > p.cfg.Size {
+		p.abort(now, frame.ReasonProtocol)
+		return
+	}
+	p.accept(now, h, end, p.zeroFill)
+}
+
+// zeroFill makes [lo, hi), a range the hole map lacks and so never
+// written, read as zero.
+func (p *Peer) zeroFill(lo, hi uint64) error {
+	switch d := p.dest.(type) {
+	case Zeroer:
+		return d.ZeroRange(int64(lo), int64(hi-lo))
+	case *os.File:
+		return safeio.ZeroRange(d, int64(lo), int64(hi-lo))
+	default:
+		_, err := p.dest.WriteAt([]byte{0}, int64(hi-1))
+		return err
+	}
+}
+
+// accept writes each range of [h.Offset, end) the hole map lacks with
+// put, then marks the span filled and folds the hash.
+func (p *Peer) accept(now time.Duration, h frame.Header, end uint64, put func(lo, hi uint64) error) {
 	if p.dest == nil {
 		p.abort(now, frame.ReasonIO)
 		return
@@ -1022,8 +1296,7 @@ func (p *Peer) onData(now time.Duration, h frame.Header, pt []byte) {
 		if end < hi {
 			hi = end
 		}
-		chunk := pt[lo-h.Offset : hi-h.Offset]
-		if _, err := p.dest.WriteAt(chunk, int64(lo)); err != nil {
+		if err := put(lo, hi); err != nil {
 			p.abort(now, frame.ReasonIO)
 			return
 		}
@@ -1045,31 +1318,57 @@ func (p *Peer) onData(now time.Duration, h frame.Header, pt []byte) {
 		p.highSent = h.SendTimeNS
 	}
 	p.dataSinceFB++
-	p.foldHash(now)
+	p.foldHash(now, foldSlack)
 }
 
-func (p *Peer) foldHash(now time.Duration) {
-	c := p.holes.Contiguous()
-	if c <= p.hashedTo {
+// foldStep bounds the hashing one call does, and the sender stops
+// sealing after this many ZERO bytes in one Pump. A run of ZEROs would
+// otherwise hold the loop on SHA-256 while the socket buffer overflows.
+// A Recv or a Pump folds at most foldSlack, so neither a ZERO nor a hash
+// that lags behind holds the receive path: a burst of ZEROs in front of a
+// PONG would otherwise inflate that RTT sample by their hashing time.
+// WakeAt is now until the hash catches up.
+const (
+	foldStep  = 1 << 20
+	foldSlack = 64 << 10
+)
+
+// foldHash reads back and hashes at most max (and foldStep) of the newly
+// contiguous prefix.
+func (p *Peer) foldHash(now time.Duration, max uint64) {
+	if p.dest == nil || p.state == stAbort {
 		return
 	}
-	buf := make([]byte, c-p.hashedTo)
-	if _, err := p.dest.ReadAt(buf, int64(p.hashedTo)); err != nil {
-		p.abort(now, frame.ReasonIO)
-		return
+	if max > foldStep {
+		max = foldStep
 	}
-	if _, err := p.hash.Write(buf); err != nil {
-		p.abort(now, frame.ReasonIO)
-		return
+	if c := p.holes.Contiguous(); p.hashedTo < c {
+		n := c - p.hashedTo
+		if n > max {
+			n = max
+		}
+		if uint64(len(p.hashBuf)) < n {
+			p.hashBuf = make([]byte, n)
+		}
+		buf := p.hashBuf[:n]
+		if _, err := p.dest.ReadAt(buf, int64(p.hashedTo)); err != nil {
+			p.abort(now, frame.ReasonIO)
+			return
+		}
+		if _, err := p.hash.Write(buf); err != nil {
+			p.abort(now, frame.ReasonIO)
+			return
+		}
+		p.hashedTo += n
 	}
-	p.hashedTo = c
 }
 
 func (p *Peer) onNACK(now time.Duration, h frame.Header, pt []byte) {
 	if !p.cfg.Sender || p.state == stDone {
 		return
 	}
-	if h.Offset > p.cfg.Size {
+	// A contiguous prefix above the bytes sent once is a lie (4.3).
+	if h.Offset > p.cfg.Size || h.Offset > p.nextNew {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
@@ -1085,8 +1384,11 @@ func (p *Peer) onNACK(now time.Duration, h frame.Header, pt []byte) {
 	// counts again.
 	var lost uint64
 	for _, sp := range holes {
+		zx := p.zeroExcessIn(sp, now)
 		p.releaseForRetx(sp, now)
-		lost += p.uncovered(sp)
+		if u := p.uncovered(sp); u > zx {
+			lost += u - zx
+		}
 		p.queueRetx(sp, now)
 	}
 	if p.pacer != nil && lost > 0 {
@@ -1141,6 +1443,32 @@ func covered(sp frame.Span, spans []frame.Span) uint64 {
 // than this is not presumed lost and its range is not sent again.
 func (p *Peer) repairTimeout() time.Duration { return 2 * p.rtt() }
 
+// zeroExcessIn is, for each ZERO in flight that sp overlaps and that a
+// NACK may count as lost (an original send, or a repair older than the
+// repair timeout), the overlap beyond the ZERO's charge. The caller takes
+// it off the hole's lost bytes, so a lost ZERO counts at most its charge
+// even when a hole covers it only in part (section 4.7).
+func (p *Peer) zeroExcessIn(sp frame.Span, now time.Duration) uint64 {
+	win := p.repairTimeout()
+	var zx uint64
+	for _, s := range p.inflight {
+		if !s.zero || (s.retx && now-s.at < win) || s.end <= sp.Start || s.start >= sp.End {
+			continue
+		}
+		lo, hi := s.start, s.end
+		if sp.Start > lo {
+			lo = sp.Start
+		}
+		if sp.End < hi {
+			hi = sp.End
+		}
+		if ov := hi - lo; ov > s.n {
+			zx += ov - s.n
+		}
+	}
+	return zx
+}
+
 // releaseForRetx takes original sends of sp out of the inflight count,
 // and retransmissions of sp older than the repair timeout, which are
 // presumed lost. A younger retransmission stays until noteContig covers it.
@@ -1165,7 +1493,7 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 	if !p.cfg.Sender || p.state == stDone {
 		return
 	}
-	if h.Offset > p.cfg.Size {
+	if h.Offset > p.cfg.Size || h.Offset > p.nextNew {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
@@ -1189,7 +1517,7 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 			p.fbDeliv = d
 			p.progress(now)
 		}
-		p.pacer.Sample(d, now)
+		p.pacer.Sample(p.wireDelivered(d), now)
 		// newly_lost_bytes names the holes a NACK names; the NACK path
 		// counts them once (docs/design.md section 6).
 		if f.ECNCECount > 0 {
@@ -1202,6 +1530,32 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 		p.lastEcho = f.EchoSendTimeNS
 		p.noteRTT(now-time.Duration(f.EchoSendTimeNS), now)
 	}
+}
+
+// wireDelivered is the pacer's delivery count for delivered_bytes d
+// (section 4.7): a ZERO counts its 88-byte datagram, not its length. Below
+// contig it is exact. Above contig, the excess of every ZERO sent once and
+// not yet below contig is taken off, so it may fall short of the wire
+// bytes delivered there, never exceed them.
+func (p *Peer) wireDelivered(d uint64) uint64 {
+	c := p.contig
+	if c > p.nextNew {
+		c = p.nextNew
+	}
+	if d > p.nextNew {
+		d = p.nextNew
+	}
+	var w uint64
+	if c > p.zeroBelow {
+		w = c - p.zeroBelow
+	}
+	if d <= c {
+		return w
+	}
+	if above := d - c; above > p.zeroAboveX {
+		w += above - p.zeroAboveX
+	}
+	return w
 }
 
 // checkUndo closes the range-probe record (section 4.5, undo). The
@@ -1302,6 +1656,9 @@ func (p *Peer) onPing(now time.Duration, h frame.Header, pt []byte) {
 	if len(pt) != 0 {
 		p.abort(now, frame.ReasonProtocol)
 		return
+	}
+	if p.cfg.Sender && !p.cfg.NoZero && h.Offset&frame.ZeroOK != 0 {
+		p.peerZero = true
 	}
 	p.send(now, frame.Header{Type: frame.TypePONG, Offset: h.Offset}, frame.EncodePong(h.SendTimeNS, 0))
 }
@@ -1423,7 +1780,10 @@ func (p *Peer) maybeVerify(now time.Duration) {
 	if p.committed || p.state == stAbort || !p.finSeen || !p.holes.Empty() {
 		return
 	}
-	p.foldHash(now)
+	// Every byte is in: fold foldStep per Pump. WakeAt brings the next
+	// Pump 1 µs later and FEEDBACK keeps flowing, so neither peer idles
+	// while a long sparse tail is hashed.
+	p.foldHash(now, foldStep)
 	if p.state == stAbort {
 		return
 	}
@@ -1486,6 +1846,9 @@ func (p *Peer) nextLen() uint64 {
 	}
 	if p.nextNew >= p.cfg.Size {
 		return 1
+	}
+	if p.hasPend && p.pend.sp.Start == p.nextNew {
+		return p.pend.charge()
 	}
 	n := p.cfg.Size - p.nextNew
 	if n > mss {

@@ -34,8 +34,11 @@ type slot struct {
 }
 
 type flow struct {
-	token   [seal.TokenSize]byte
-	cap     uint64
+	token [seal.TokenSize]byte
+	cap   uint64
+	// ctl is the bytes of non-DATA datagrams forwarded, against
+	// cap + CtlAllowance.
+	ctl     uint64
 	used    uint64
 	expires time.Duration
 	fails   int
@@ -160,10 +163,26 @@ func (f *flow) pin(from string) (me, other *slot, just, ok bool) {
 	}
 }
 
-// charge counts DATA plaintext, including retransmits. A zero length does
-// not trip. A wrap or a cap breach trips and does not add.
+// CtlAllowance is what non-DATA datagrams may use beyond byte_cap: an hour
+// of FEEDBACK at its 5 ms floor is 92 MB (docs/design.md section 8).
+const CtlAllowance = 256 << 20
+
+// charge counts DATA plaintext, including retransmits, against the cap,
+// and every other datagram at its whole length against cap+CtlAllowance,
+// so a key holder cannot push unbounded ZEROs or control frames through.
+// A zero-length DATA does not trip. A wrap or a breach trips and does not
+// add.
 func (f *flow) charge(h frame.Header) bool {
 	if h.Type != frame.TypeDATA {
+		n := uint64(frame.Overhead) + h.PayloadLen
+		limit := f.cap + CtlAllowance
+		if limit < f.cap {
+			limit = ^uint64(0)
+		}
+		if f.ctl+n < f.ctl || f.ctl+n > limit {
+			return true
+		}
+		f.ctl += n
 		return false
 	}
 	n := h.PayloadLen

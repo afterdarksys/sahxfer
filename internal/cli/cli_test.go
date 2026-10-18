@@ -483,6 +483,41 @@ func TestDirectGet(t *testing.T) {
 	copyDirect(t, "get", bytes.Repeat([]byte("xyz"), 1700))
 }
 
+// --diag adds only "diag " lines on stderr: the granted buffers on each
+// side. Without it stderr stays empty on success (assertOK).
+func TestDiagPut(t *testing.T) {
+	isolate(t)
+	root := phys(t)
+	if err := os.Mkdir(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body := bytes.Repeat([]byte("diag"), 5000)
+	src := filepath.Join(root, "src.bin")
+	writeBytes(t, src, body)
+	g, path := makeGrant(t, "put", root, "inbox/app.bin", body, nil)
+	addr := freeUDP(t)
+	rx := goCmd(ctx, "recv", "--diag", "--grant", path, "--listen", addr, "--root", root)
+	time.Sleep(100 * time.Millisecond)
+	tx := await(t, goCmd(ctx, "put", "--diag", "--grant", path, "--to", addr, src))
+	rr := await(t, rx)
+	for _, r := range []cmdResult{tx, rr} {
+		lines := strings.Split(strings.TrimSpace(r.err), "\n")
+		var rcv, snd int
+		if _, err := fmt.Sscanf(lines[0], "diag rcvbuf=%d sndbuf=%d", &rcv, &snd); err != nil || rcv <= 0 || snd <= 0 {
+			t.Fatalf("stderr %q", r.err)
+		}
+		for _, l := range lines {
+			if !strings.HasPrefix(l, "diag ") {
+				t.Fatalf("non-diag stderr line %q", l)
+			}
+		}
+		r.err = ""
+		assertOK(t, r, g)
+	}
+}
+
 func TestEmptyPut(t *testing.T) {
 	copyDirect(t, "put", nil)
 }

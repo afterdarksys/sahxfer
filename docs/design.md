@@ -239,16 +239,17 @@ No other cipher in v1. No negotiation. No `crypto=off`.
 | `FIN` | 4 | Empty. `offset` is the file size. Sender has put every byte on the wire at least once. |
 | `DONE` | 5 | 32-byte SHA-256. `offset` is the file size. Sent only after fsync and rename. |
 | `ABORT` | 6 | One `u64` reason. |
-| `PING` | 7 | Empty. `offset` is the probe id. |
+| `PING` | 7 | Empty. `offset` is the probe id. Bit 62 of a receiver's probe id is `ZERO_OK` (§4.7). |
 | `PONG` | 8 | `u64 echo_send_time_ns`, `u64 receiver_delay_ns`. `offset` echoes the probe id. |
+| `ZERO` | 9 | One `u64 length`. `offset` is the file position. The span is all zero bytes (§4.7). |
 
-Unknown type on an authentic packet aborts with `protocol`. A packet that fails AEAD is dropped with no abort.
+Unknown type on an authentic packet aborts with `protocol`. A packet that fails AEAD is dropped with no abort. A receiver that did not set `ZERO_OK` treats `ZERO` as unknown.
 
 Flags:
 
 | Bit | Name | Where it is legal |
 | --- | --- | --- |
-| 0 | `RETX` | `DATA` only. This range is a retransmission. |
+| 0 | `RETX` | `DATA` and `ZERO`. This range is a retransmission. |
 | 1 | `CLOSE_ACK` | `FIN` only, and only after the sender has accepted a valid `DONE`. |
 
 Any other bit, or a bit set on a type where it is not legal, aborts with `protocol` after the packet opens. A later feature is a version bump, not a new quiet bit.
@@ -275,7 +276,7 @@ hole_count times:
     u64 end       // exclusive
 ```
 
-`hole_count` is 0 through 32. Holes are ordered, non-overlapping, and each `start < end <= size`. The list names the oldest mature holes that fit. More holes travel in the next NACK.
+`hole_count` is 0 through 32. Holes are ordered, non-overlapping, and each `start < end <= size`. The list names the oldest mature holes that fit. More holes travel in the next NACK. A NACK or `FEEDBACK` whose `offset` (the receiver's contiguous prefix) is above the bytes the sender has sent once aborts with `protocol`: no honest receiver holds a contiguous byte that never left, and the sender's delivery count for the controller starts from that offset (§4.7), so it must not exceed what was sent.
 
 A hole is mature when a byte past its end has been accepted, or when it is older than `max(3 * srtt, 1 ms)` and any later seq has been accepted. The trailing edge, where later bytes simply have not arrived, is not a hole. `FIN` plus a timer covers that tail.
 
@@ -336,13 +337,49 @@ Why. A NACK can name only a hole below the highest byte the receiver holds, so w
 
 `ABORT` is sent best-effort, then the grant is dead. The helper deletes the temp file. A late `DATA` for a dead grant is dropped.
 
+### 4.7 ZERO (zero-run skipping)
+
+Disk images, VM disks, and preallocated databases carry long runs of zero bytes. Measured on this tree's build host (2026-10-18, scratch `zero/scan.txt`): an 8.6 GB raw Linux image is 90.6% zero in 1152-byte blocks (89.5% of it a sparse hole, plus 10.5% of the allocated extents), a 64 GB Docker Desktop VM disk is 31.4% zero (holes plus 14.1% of a 4 GB sample of its extents), and an ISO, a Go binary, and a source tar are 0.0 to 1.5%. Comparing a 1152-byte block with zero costs 19 ns when it is zero (0.016 ns per byte) and 4 ns when the first word is not, against about 25 ms per MB the pipeline spends now. General compression is a v2 protocol (`docs/compression-study-2026-10-18.md`) because it moves bytes off file offsets. A zero run does not: its offset and length name the bytes exactly, so `ZERO` keeps every offset a file offset, keeps NACK and the hole map as they are, and keeps SHA-256 over the whole file.
+
+Frame. `ZERO` is type 9. `offset` is the file position. The payload is 8 bytes, `u64 length`, sealed like any payload. `[offset, offset+length)` is all zero bytes. It shares the `DATA` sequence space and nonce rule, may carry `RETX`, and a forged one fails AEAD like a forged `DATA`.
+
+Negotiation. A receiver that accepts `ZERO` sets bit 62 (`ZERO_OK`) in the `offset` of every `PING` it sends. The sender sends `ZERO` only after an authentic `PING` with that bit. Until then, and with a receiver that never sets it, zero bytes go as `DATA`. Smallest change that a v1 peer cannot trip on:
+- A header flag on `PING` would abort a v1 sender (`protocol` on a flag on the wrong type).
+- Version 2 is dropped before AEAD by a v1 peer and a v1 relay, so it degrades safely, but it needs the seal, the relay, and a second header path.
+- A grant field changes the 18-line lease payload and its golden vector, which the server and the agent share byte for byte: three repositories.
+- The probe id is opaque to a v1 peer. A v1 sender echoes it in `PONG` and does not read it. A v1 receiver counts probe ids up from 1, so it never sets bit 62. Neither old peer sees a change, and the datagram version stays 1. The bit travels inside AEAD; only the peer that holds the grant key can claim it, and a receiver that claims it and then mishandles `ZERO` only fails its own transfer's hash.
+
+Detection, on the sender, for new bytes. With `ZERO_OK`, each block of `MSS` bytes at a multiple of `MSS` is compared with zero before it is sealed. The last block of the file may be shorter than `MSS`. A zero block starts a run; the sender reads on, block by block, while each block is zero, up to `floor(1 MiB / MSS) * MSS` bytes or the end of the file, and sends the run as one `ZERO`. A run of at least `MSS` bytes is a `ZERO`. A file's short final block alone is not: it goes as `DATA`, so a `ZERO` is never shorter than one `DATA` would have been, except the file's tail joined to a run. A run longer than the cap is several `ZERO`s, each starting at a multiple of `MSS`. A non-zero block goes as `DATA` from the buffer it was read into, so a file with no zeros costs one compare per block and no extra read.
+
+Repair. A NACK hole or a stall probe inside a zero run is a range like any other. The repair reads the range again; a zero prefix of at least `MSS` bytes, or a range that is zero to its end, goes as `ZERO`, otherwise `DATA` of up to `MSS`. Either frame carries the same bytes at the same offset, so the one-plaintext rule (§5) holds whichever the sender picks. A range first sent as `DATA` and repaired as `ZERO` is counted for the controller as the `DATA` bytes it was first sent as, which over-counts the wire by at most that range less 88 bytes. It happens only to zero bytes sent before `ZERO_OK` arrived (about one RTT of data at the start) or to a zero tail of a repaired range, and each such range is counted once; the bandwidth sample it inflates is at most one round's.
+
+Charge. Pacing, the in-flight cap, and loss are about wire bytes; delivery, the hole map, and `byte_cap` are about file bytes.
+- In flight and pacing: a `ZERO` is charged 88 bytes, its whole datagram (`DATA` stays charged its payload). `CanSend`, `OnSend`, the in-flight count, and the bytes released when it is filled or presumed lost use 88.
+- Loss: a lost `ZERO`, from a NACK or a range probe, counts 88 bytes. A NACK hole that overlaps a `ZERO` only in part (a hole split by a partial repair) is charged the overlap less the `ZERO`'s length beyond 88 bytes, so it too counts at most 88. Counting its length would turn one dropped 88-byte datagram into a 1 MiB loss and, with several, a cut.
+- Bandwidth: `FEEDBACK` `delivered_bytes` counts a `ZERO` as `length` file bytes, as the receiver holds them. The sender clamps it to the bytes it has sent once (§6), giving `d`, and feeds the controller `(contig - Zb) + max(0, d - contig - Za)`. `Zb` is `length - 88` summed over the `ZERO`s sealed for the first time that lie wholly below `contig`; `Za` is the same over the rest. Below `contig` the count is exact. Above it, every `ZERO` not yet below `contig` is taken off whether or not it landed, so the count can fall short there and never exceeds the wire bytes delivered. A first version subtracted every `ZERO` sent from `d`: while a `ZERO` was in flight the count dipped under its previous maximum, the `DATA` delivered meanwhile was credited in one round when the `ZERO` landed, and on a 5 MB/s simulated link with 4 MiB zero runs the estimate reached 14 MB/s with 274 tail drops. Without any adjustment it reached 214 MB/s with 6218 drops. The rule above keeps it at 4.7 MB/s with none. A peer that reports more than the file is clamped first, so it cannot raise the estimate either.
+- `byte_cap`: unchanged in meaning. The sender adds a `ZERO`'s `length` when it seals it for the first time; the receiver's unique accepted bytes include it. A grant's cap is at least `size`, so an honest transfer cannot trip it, and a `ZERO` cannot be used to move more than the cap. The relay charges `DATA` payload only; it cannot read a `ZERO`'s length, and like the other control frames a `ZERO` costs it 88 bytes uncharged.
+
+Receiver, after the packet opens:
+- Refused with `protocol`: a payload other than 8 bytes, `length` 0, `length` above 1 MiB, `offset + length` wrapping or past `size`, `size` 0, or a receiver that did not set `ZERO_OK`. The 1 MiB bound caps the work one datagram can ask for (each side hashes a `ZERO`'s bytes); the size bound keeps a `ZERO` inside the grant like a `DATA`.
+- For each range of the span that the hole map still lacks: extend the temp file to the range end with `ftruncate` if it is shorter (never shrink it), then deallocate the block-aligned inside of the range with `fallocate(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE)` on Linux or `fcntl(F_PUNCHHOLE)` on Darwin. A filesystem that does not support the punch is not an error. A range the hole map lacks was never written (first write wins, and the write happens before the accept), so it already reads as zero once the file covers it: the punch is a no-op on a filesystem that left it sparse and frees blocks on one that allocated them on extend. An extend that fails is `io`. A file without those calls (the in-process tests) writes one zero byte at the end of the range, which extends the file and reads the same.
+- Then the span is accepted into the hole map, counted toward `delivered_bytes`, raises `highest_seq_received` when it added bytes, and counts toward the 64-packet `FEEDBACK` trigger, exactly as `DATA` of `length` bytes.
+- The streaming hash folds the contiguous prefix by reading it back from the temp file, zero ranges included, in chunks of at most 1 MiB. A received packet and a `Pump` each fold at most 64 KiB, and while the hash lags the next `Pump` is due 1 µs later, so the `FEEDBACK` and NACK timers still run; after `FIN`, with the hole map empty, each `Pump` folds 1 MiB until the hash reaches `size`, and `FEEDBACK` keeps flowing, so neither peer goes idle while a large sparse tail is hashed. Measured: a 2 GB file, 88% zero, over loopback with `idle_seconds` 8 committed in 29.5 s; in process the hash lagged the contiguous prefix by at most 253 MB, about 0.8 s at the 329 MB/s Go SHA-256 does on the build host, hashed in 3 ms steps between which `FEEDBACK` goes out. The lag is bounded by `size` only in principle (an all-zero file arriving faster than it hashes); the receiver must hash every byte either way, so `max_seconds`, not `idle_seconds`, is the limit that applies. So a run of `ZERO`s neither allocates its length nor holds the receive loop on SHA-256, and a hash that lags does not slow every `DATA` behind it. The sender seals at most one `ZERO` per `Pump`, and none while another datagram sealed in that `Pump` (a `PONG`, a `FIN`, a `DATA`) waits: it checks before it scans past the first zero block, so a `PONG` never waits behind a cold 1 MiB read. A first version allowed 16 MiB per `ZERO` and hashed a whole contiguous run at once: each side then spent about 40 ms per `ZERO` on SHA-256 without reading its socket, the receive buffer overflowed, and a 300 MB, 50%-zero loopback transfer took 135 s instead of 4. The hash, `DONE`, the `FIN` size check, and the commit order are unchanged. A sender cannot skip the hash: the receiver hashes the bytes the file now holds, and a `ZERO` over a range that is not zero in the source fails `hash_mismatch`.
+- Idle and the agent events: an authentic `ZERO` resets the idle timer like any authentic packet; the `active` and `result` byte counts are file bytes and include zero runs. v1 has no resume (§12); when it lands, its prefix hash is over file bytes, so a zero run resumes like any other range.
+
+Measured on the same host, one core each side:
+- Loopback UDP, 300 MB with 51% zero in runs of 64 KiB to 64 MiB, two runs each, quiet host: 6.6 and 7.8 s with 329 to 331 MB on `lo0` before; 4.2 to 5.2 s with 158 to 160 MB after. Busier host, final build: 9.8 and 10.5 s before, 8.4 and 8.5 s after, 158 MB against 330 MB on the wire. The target holds 159 MB of blocks against 302 MB before. A 300 MB random file is unchanged within the run-to-run spread.
+- In process (`TestZeroLargeSparseFile`, a 100 MB/s, 1 ms simulated link), 200 MiB at 54% zero: 1.07 s and 104 MB on the wire with 109 `ZERO`s, against 2.28 s and 224 MB for the same file sent as `DATA` and for a random file.
+- Linux (golang:1.27 container on the same host, loopback): 30 MB at 52% zero took 0.79 s in one run and 8.9 s in another; the container's bimodal rate (§7.4) dominates there.
+
+Threats: a forged `ZERO` fails AEAD. A `ZERO` past the grant size, wrapping, empty, or above 1 MiB aborts with `protocol`. A `ZERO` sent to a receiver that did not ask for it aborts with `protocol`. A lying `delivered_bytes` is clamped to the bytes sent once before `Z` is subtracted. A `ZERO` over non-zero source bytes is a hash mismatch, not a silent corruption. Not defended: a receiver on a filesystem without sparse files stores the zeros in full, which is what `DATA` would have cost.
+
 ## 5. Reliability
 
 The sender keeps the file. It does not keep a second copy of packets it can rebuild from disk plus the cipher. A retransmission reads that range again, seals it under a new seq, and sets `RETX`. The plaintext at a given offset is fixed for the life of the grant. The sender must not seal two different plaintexts at the same offset.
 
 The receiver, after a successful open:
 
-- If `[offset, offset+len)` is already filled, drop the plaintext. First write wins. Do not read the file back to compare. Replay of the same bytes is a no-op. A sender that violates the one-plaintext rule is a broken sender; the receiver will hash-mismatch and abort.
+- If `[offset, offset+len)` is already filled, drop the plaintext. First write wins. A `ZERO` is the same with its `length` and no plaintext: the missing ranges are made to read as zero (§4.7). Do not read the file back to compare. Replay of the same bytes is a no-op. A sender that violates the one-plaintext rule is a broken sender; the receiver will hash-mismatch and abort.
 - Otherwise `pwrite` the plaintext at `offset` (or the io_uring equivalent) and mark the range filled.
 - Update the streaming SHA-256 only for bytes that just became part of the contiguous prefix. Out-of-order ranges sit in the file and in the hole map until the gap in front of them closes, then they fold into the hash in order.
 
@@ -350,7 +387,7 @@ The hole map starts as `[0, size)` and is an interval set of missing ranges. It 
 
 Reorder is normal. A gap is not loss until it is mature (§4.3). Spurious retransmission is harmless because of first-write-wins.
 
-`byte_cap` counts unique file bytes the sender has sealed for the first time, plus unique bytes the receiver has accepted. A retransmission does not add to the cap. Exceeding the cap aborts with `byte_cap`.
+`byte_cap` counts unique file bytes the sender has sealed for the first time, plus unique bytes the receiver has accepted, a `ZERO` by its `length` (§4.7). A retransmission does not add to the cap. Exceeding the cap aborts with `byte_cap`.
 
 Empty file: sender sends `PING`, waits for one `PONG`, sends `FIN` with `offset=0`. Receiver commits a 0-byte temp file, renames, sends `DONE` with the SHA-256 of the empty input (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 
@@ -360,7 +397,7 @@ NACK repair is not a congestion signal by itself, and there is no ACK clock. v1 
 
 Signals the sender must use:
 
-- Bandwidth, from `delivered_bytes`. The sender ignores a `delivered_bytes` that is not greater than the largest it has used, so a reordered `FEEDBACK` does not move the count back and let the next sample count the same bytes twice. It clamps the value to the unique file bytes it has sent, so an authenticated peer that reports more cannot raise the estimate past what left the sender.
+- Bandwidth, from `delivered_bytes`. The sender ignores a `delivered_bytes` that is not greater than the largest it has used, so a reordered `FEEDBACK` does not move the count back and let the next sample count the same bytes twice. It clamps the value to the unique file bytes it has sent, so an authenticated peer that reports more cannot raise the estimate past what left the sender. It then subtracts the bytes `ZERO` frames represent beyond their 88-byte datagram (§4.7), so a zero run is measured as the wire bytes it took.
 - RTT, from `PING`/`PONG` (`send_time` echoed, plus `receiver_delay_ns`) and from `echo_send_time_ns` on `FEEDBACK`. The `FEEDBACK` echo is the `send_time_ns` of the highest-sequence `DATA` ever accepted, sent only when some `DATA` was accepted since the previous `FEEDBACK`, and 0 otherwise (section 4.4). The sender takes an RTT sample only from an echo greater than the last echo it sampled. A repeated echo is not a sample: after the last `DATA`, a timer `FEEDBACK` that repeated the same old send time every 5 ms would grow `srtt` by 5 ms each time, the `FIN` retry would back off with it, and a burst of lost `FIN`s would end in `idle`. The `DATA` behind a fresh echo, one greater than any echo before it, arrived after the previous `FEEDBACK`, so the sample also holds the time it waited for this one: at most one FEEDBACK interval (`max(5 ms, srtt / 4)`) plus the receiver's scheduling delay, and close to 0 when the 64-`DATA` trigger sent it. The pacer's min-RTT filter discards that hold. The sender's `srtt` keeps it, so its `FIN`, stall-probe, and repair timers allow for one FEEDBACK interval. A `PONG` whose echoed send time is earlier than the moment this peer accepted its first authentic packet is not an RTT sample, on either peer: that `PING` may have waited in a listener's pre-pin queue or in the relay's 1 s hold (section 8), and the delay would become `srtt`. Each peer sends one fresh `PING` when it first hears the other, so a dropped sample is replaced one RTT later.
 - Loss, from NACKs. The repair timeout is `2 * srtt`. The newly lost bytes of a NACK are the bytes in its holes that are neither queued for repair nor covered by a retransmission sent within the repair timeout. A retransmission older than the repair timeout inside a NACKed hole is presumed lost: it leaves the in-flight count, its range is sent again, and its bytes count as newly lost again. The timeout is `2 * srtt`, not `srtt`, because a NACK shows the receiver as it was a one-way delay earlier and queueing can hold a repair past `srtt`; with `srtt`, a 1% loss simulation counted 90 losses for 86 drops and sent the 4 extra repairs. A re-NACK of a hole whose repair is still in flight adds nothing, so the receiver repeating its hole list every RTT is not repeated loss. `newly_lost_bytes` on `FEEDBACK` is not used by the controller: it names the same holes the NACK names, and using both would count one loss twice. An `ecn_ce_count` increase counts one MSS of loss per new mark. A range probe (section 4.5) counts the bytes it releases as newly lost, the strongest loss signal, as a TCP retransmission timeout is, unless the undo rule in section 4.5 finds it spurious and removes that loss again; its queued ranges then cover later NACKs of the same bytes, so they are not counted twice. The tail probe is not a loss signal: it is sent on silence, which an RTT step-up also causes.
 - Application-limited, once the sender has no new file bytes and is only retransmitting.
@@ -404,7 +441,7 @@ The page cache is the source of the read. v1 does not use `O_DIRECT` and does no
 
 1. `recvmmsg` or a multishot io_uring recv into a registered buffer.
 2. AEAD open in that buffer.
-3. `WRITE_FIXED` / `pwrite` at `offset` into the temp file.
+3. `WRITE_FIXED` / `pwrite` at `offset` into the temp file. A `ZERO` extends the file and punches the range (§4.7) instead.
 4. One `fsync` at commit, not per packet.
 
 The file is the reassembly buffer. The receiver does not queue out-of-order payloads in a second byte buffer.
@@ -414,6 +451,27 @@ The file is the reassembly buffer. The receiver does not queue out-of-order payl
 The fast path is Linux io_uring on the helper. That backend is not in this repo: nothing here pretends to submit `READ_FIXED` or `SEND_ZC`. macOS and the portable build use `pread` / `pwrite` and `sendmsg` / `recvmsg` with the same frames. Tests for loss, reorder, and AEAD run without a NIC, in process, on either OS. Path open on Linux is `openat2` as in §3.4. The Darwin build walks each component with `O_NOFOLLOW`. That walk is not `openat2` and must not be described as if it were.
 
 `O_DIRECT`, `sendfile`, and `splice` are not in v1. They skip the place the cipher has to run, or they fight the page cache for small datagrams.
+
+### 7.4 Socket buffers, batching, and agent install notes
+
+A paced sender still bursts: a late wake-up sends up to 1 ms of data at once (§6), and a receiver that stops reading for a moment (a page fault, a `fsync`, the 1 MiB hash step of §4.7) has only its socket buffer between the burst and a drop. The OS defaults are small: 208 KiB on most Linux kernels, 768 KiB of UDP receive space on Darwin.
+
+Both peers ask for 8 MiB of `SO_RCVBUF` and `SO_SNDBUF` when the socket opens. A refused size (Darwin returns `ENOBUFS` above `kern.ipc.maxsockbuf`) is halved and retried, down to 64 KiB, then the default stays. The granted size is read back with `getsockopt` and reported as `getsockopt` gives it: Linux reports twice what it allows for data, because it doubles the request for its own bookkeeping, and caps the request at `net.core.rmem_max` and `net.core.wmem_max` without an error. An unprivileged process cannot raise those caps, and the helper runs as the dropped identity user, so it does not try (`SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`), and sahxfer never writes a sysctl.
+
+Reported: `recv`'s `ready` event carries `rcvbuf`, the granted receive buffer in bytes (PROTOCOL.md §1.1). With `--diag`, `put`, `get`, and `recv` write `diag rcvbuf=<n> sndbuf=<n>` on stderr when the socket opens. The data receiver then checks once a second: when its usable receive buffer (the granted size, half of it on Linux) is below `rate * max(RTprop, 5 ms)`, with `rate` its measured arrival rate in wire bytes and `RTprop` its least RTT sample, it writes one `diag warn rcvbuf=<n> usable=<n> need=<n> rate=<B/s> rtt=<d>` line with `--diag` and no more for that run. Without `--diag` stderr keeps its contract (a code on failure, nothing else). `max(RTprop, 5 ms)` is the round length of §6: the cap lets about one round of data be in flight, and a receiver that stalls for one round needs that much buffer to lose nothing.
+
+Reading when there is work. When the engine has work due now, the runner's read must not block, but it must still read. It used to set a read deadline of now; Go returns a timeout for a deadline already passed without calling `recvfrom`, so a peer with continuous work read nothing until it went idle. A sender sealing six 1 MiB `ZERO`s back to back (about 7 ms each under CPU load) left the receiver's `PING` unread for 40 ms, the receiver's only RTT sample became 51 ms, its `FEEDBACK` interval `srtt / 4` became 12.7 ms, longer than the `2 * 5 ms` the cap needs to grow past `10 * MSS`, and the controller stayed at 1 MB/s for the whole grant. A zero wait is now one non-blocking receive (`MSG_DONTWAIT` through `syscall.RawConn`, deadline cleared). Linux loopback in the golang:1.27 container is bimodal and this fix does not settle it: 30 MB of random data takes either 0.8 to 1.3 s or 20 to 25 s, with and without it, and `TestLoopbackThroughput30MB` fails there most runs at the previous commit and now. In a slow run the sender's cap stays near `2 * bw * 5 ms` (about 20 KB) with in-flight bytes below it and the estimate near 2 MB/s, which is the `10 * MSS` per `FEEDBACK` interval arithmetic of §6: a `FEEDBACK` interval longer than 5 ms makes `bw = cap / interval` a fixed point. Open; it needs its own change to §6. With twelve busy processes on the build host, a 300 MB file that is 52% zero went from not finishing in 120 s to 30 to 43 s (the old build, all `DATA`: 41 to 62 s). The engine also lets datagrams it has already sealed in a `Pump` (a `PONG`, a `FIN`) leave before it starts the hashing a `ZERO` costs.
+
+Batching, Linux only (build tag `linux`). The receive loop takes up to 32 datagrams per `recvmmsg` and pumps the engine once per batch; the send path hands every datagram one `Pump` produced to `sendmmsg`, retrying the remainder of a partial send. Both use `golang.org/x/sys/unix` syscall numbers with `Msghdr` and `Iovec`; they wait through the Go netpoller (`syscall.RawConn`), so read deadlines and cancellation behave as before. Measured with `strace -c` on 10 MB in the container: the receiver's socket calls fell from 11,242 (`recvfrom` and `sendto`) to 7,817 (`recvmmsg` and `sendmmsg`, about 1.8 datagrams per `recvmmsg`); the sender's stayed near 16,900, because one `Pump` produces about one datagram and the zero-wait read polls. Socket calls are 2 to 4% of syscall time on either side; Go's `futex` and `nanosleep` are about 90%. A listener's source address comes from each message's `msg_name` and is pinned exactly as before; a datagram from another source in the same batch is dropped. Darwin and the portable build keep one `recvfrom` and one `sendto` per datagram.
+
+Agent install notes. On a Linux host that runs the helper, set, as root, in `/etc/sysctl.d/90-sahxfer.conf`:
+
+```
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+```
+
+then `sysctl --system`. 16 MiB leaves the 8 MiB request whole after Linux doubles it. At 1 Gbit/s and a 50 ms RTT the formula above asks for about 6 MB; at the 5 ms floor, 0.6 MB. On the Darwin build host (`kern.ipc.maxsockbuf` 8 MiB) the 8 MiB request is granted whole for both buffers. The values are a recommendation for the host install, not something the helper or the agent sets.
 
 ## 8. Relay
 
@@ -427,7 +485,7 @@ On a packet:
 4. If this direction has no pinned 4-tuple, pin the source address. If it has one and the source differs, drop. A third peer cannot join.
 5. Forward the datagram unchanged to the other pinned peer. If the other peer is not pinned yet, hold at most one datagram per direction for `1 s`, then drop.
 
-The relay does not log the route token. It does not rewrite seq or offset. It does not fragment. It applies a per-grant forwarding cap equal to `byte_cap` plus header overhead, then drops and reports `byte_cap`.
+The relay does not log the route token. It does not rewrite seq or offset. It does not fragment. It applies two per-grant budgets, then forgets the grant and reports `byte_cap`. `DATA` payload, retransmissions included, is charged against `byte_cap`. Every other datagram is charged its whole length against `byte_cap + 256 MiB`. Without the second budget a key holder could push unbounded 88-byte `ZERO`s, or any control frame, through the relay. The allowance covers an honest grant: `FEEDBACK` at its 5 ms floor for the 3600 s maximum is 92 MB, and `ZERO`s cost at most 88 bytes per `MSS` of the file, under 8% of `size`, which `byte_cap` already covers.
 
 The agent reaches the relay by sending the first packet itself (outbound), the same way it phones home. The client's first packet pins the other side. Order does not matter.
 
@@ -495,6 +553,7 @@ A `DATA` that arrives in `VERIFYING` for an already-filled range is ignored. A `
 | Live grants per actor | 2 |
 | Auth failures per grant | 32 |
 | NACK holes per packet | 32 |
+| `ZERO` length | 1 MiB |
 | Relay hold when the peer is unknown | 1 datagram, 1 s |
 | Bridge queue | 4 MiB |
 
@@ -505,7 +564,7 @@ A limit breach aborts. It does not truncate and commit.
 - Directory trees, delete, or an rsync delta. That stays `sahsync`.
 - More than one file per grant.
 - Resume. A failed grant deletes the temp file. A new grant starts at offset 0. Resume needs a prefix hash and a new grant that names a kept temp file. That is a later spec, and it is not implied by this one.
-- Hole punching, `crypto=off`, 0-RTT, a decrypting bridge, `O_DIRECT`, `mmap` send.
+- NAT hole punching, `crypto=off`, 0-RTT, a decrypting bridge, `O_DIRECT`, `mmap` send.
 - Sharing the SystemAPI WebSocket as a fallback byte path. If UDP and QUIC are both blocked, the transfer fails. The operator uses `sahsync`.
 
 ## 13. Build order
@@ -539,6 +598,7 @@ Phase 1 does not add a Go module until the frame tests have a directory to live 
 - The 32nd AEAD failure, or the 32nd route-token mismatch: grant dead, temp file gone. A mismatch is counted once. The packet is not also opened.
 - `quic-datagram` with inner pacing enabled: the test fails. The controller must be off.
 - Logs from a transfer fixture do not contain the bearer, the key, or the route token.
+- `ZERO` past `size`, wrapping, of length 0 or above 1 MiB, with a payload other than 8 bytes, or sent to a receiver that did not set `ZERO_OK`: abort with `protocol`, temp file gone. A receiver without `ZERO_OK` receives only `DATA` and the file is identical. A `ZERO` over bytes that are not zero in the grant's file: `hash_mismatch`, target untouched.
 
 ## 15. Decisions recorded with this spec
 
@@ -549,3 +609,4 @@ Phase 1 does not add a Go module until the frame tests have a directory to live 
 - Cipher is ChaCha20-Poly1305 with a direction-and-seq nonce. The route token is 128 bits even though the other fields are 64-bit, because a 64-bit admission secret can be guessed.
 - The relay and the QUIC bridge forward sealed frames and never receive the key.
 - `put` ships before `get`. The frame format is the same.
+- Zero runs travel as `ZERO` (§4.7), negotiated by a probe-id bit, not a version. General compression waits for a v2 that moves bytes off file offsets.

@@ -181,6 +181,9 @@ func (p *Pacer) UndoLoss(lost uint64, s LossState, now time.Duration) {
 // Lost is the total newly lost bytes reported through OnLoss and OnECN.
 func (p *Pacer) Lost() uint64 { return p.lostTotal }
 
+// BW is the bandwidth estimate in bytes per second, min(bw_max, bw_lo).
+func (p *Pacer) BW() float64 { return p.estBW() }
+
 // Inflight is bytes sent and not yet filled.
 func (p *Pacer) Inflight() uint64 { return p.inflight }
 
