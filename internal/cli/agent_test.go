@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -577,6 +578,74 @@ func TestRecvAgentSweep(t *testing.T) {
 	}
 	if r := sweep(map[string]any{"root": root, "path": "../x", "grant_id": "xfr_sweep0001"}); r.code != 1 {
 		t.Fatalf("escape %+v", r)
+	}
+}
+
+func TestRecvAgentSweepReport(t *testing.T) {
+	isolate(t)
+	root := phys(t)
+	body := []byte("committed before the restart")
+	writeBytes(t, filepath.Join(root, "inbox", "app.bin"), body)
+	writeBytes(t, filepath.Join(root, "inbox", ".sahxfer-xfr_report001.part"), []byte("t"))
+	pipe := func() (*os.File, *os.File) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, w
+	}
+	report := func(path string) (cmdResult, string) {
+		cr, cw := pipe()
+		ctl, err := syscall.Dup(int(cr.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cr.Close()
+		b, _ := json.Marshal(map[string]any{"root": root, "path": path, "grant_id": "xfr_report001"})
+		if _, err := cw.Write(append(b, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		cw.Close()
+		er, ew := pipe()
+		ev, err := syscall.Dup(int(ew.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ew.Close()
+		// recv takes ownership of both fds and closes them.
+		c, o, e := runCmd(context.Background(), "recv", "--sweep", "--report", "--ctl-fd", fmt.Sprint(ctl), "--event-fd", fmt.Sprint(ev))
+		out, _ := io.ReadAll(er)
+		er.Close()
+		return cmdResult{c, o, e}, string(out)
+	}
+	r, ev := report("inbox/app.bin")
+	sum := sha256.Sum256(body)
+	want := fmt.Sprintf(`{"ev":"target","bytes":%d,"sha256":"%s"}`+"\n", len(body), hex.EncodeToString(sum[:]))
+	if r.code != 0 || r.out != "" || ev != want {
+		t.Fatalf("%+v %q", r, ev)
+	}
+	if _, err := os.Stat(filepath.Join(root, "inbox", ".sahxfer-xfr_report001.part")); !os.IsNotExist(err) {
+		t.Fatal("temp kept")
+	}
+	if r, ev := report("inbox/absent.bin"); r.code != 0 || ev != "" {
+		t.Fatalf("absent %+v %q", r, ev)
+	}
+	if r, ev := report("missing/absent.bin"); r.code != 0 || ev != "" {
+		t.Fatalf("absent dir %+v %q", r, ev)
+	}
+	if err := os.Symlink(filepath.Join(root, "inbox", "app.bin"), filepath.Join(root, "inbox", "link.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if r, ev := report("inbox/link.bin"); r.code == 0 || ev != "" {
+		t.Fatalf("symlink %+v %q", r, ev)
+	}
+	for _, args := range [][]string{
+		{"recv", "--sweep", "--report", "--ctl-fd", "3"},
+		{"recv", "--sweep", "--report", "--ctl-fd", "3", "--event-fd", "3"},
+		{"recv", "--report", "--ctl-fd", "3", "--event-fd", "4"},
+		{"recv", "--sweep", "--report=false", "--ctl-fd", "3", "--event-fd", "4"},
+	} {
+		assertFail(t, "bad_args", args...)
 	}
 }
 

@@ -418,7 +418,13 @@ func readFirstLine(r io.Reader) (line, rest []byte, err error) {
 
 // recvSweep reads {root, path, grant_id} from the control fd and removes
 // only .sahxfer-<grant_id>.part beside that path.
-func recvSweep(ctx context.Context, ctlFD int) error {
+// recvSweep removes the one temp name the grant id fixes. With an event fd
+// (--report) it then reports the target: one line {"ev":"target","bytes",
+// "sha256"} when it is a regular file, nothing when it does not exist, so
+// the agent can tell a commit that happened before a restart from one that
+// did not. Any other failure is an error, and the agent records the outcome
+// as unknown.
+func recvSweep(ctx context.Context, ctlFD, evFD int) error {
 	ctl, err := inheritedFD(ctlFD, "ctl")
 	if err != nil {
 		return err
@@ -443,5 +449,36 @@ func recvSweep(ctx context.Context, ctlFD int) error {
 		return err
 	}
 	defer rootH.Close()
-	return rootH.RemoveTemp(doc.Path, doc.GrantID)
+	if err := rootH.RemoveTemp(doc.Path, doc.GrantID); err != nil || evFD < 0 {
+		return err
+	}
+	evf, err := inheritedFD(evFD, "event")
+	if err != nil {
+		return err
+	}
+	defer evf.Close()
+	f, err := rootH.OpenRegular(doc.Path)
+	if err != nil {
+		if e, ok := err.(*code.Error); ok && e.C == "not_found" {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	n, err := fileSize(f)
+	if err != nil {
+		return err
+	}
+	sum, err := hashFile(f, n)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(event{Ev: "target", Bytes: &n, SHA256: hex.EncodeToString(sum[:])})
+	if err != nil {
+		return code.New("io")
+	}
+	if _, err := evf.Write(append(b, '\n')); err != nil {
+		return code.New("io")
+	}
+	return nil
 }

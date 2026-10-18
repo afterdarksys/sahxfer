@@ -141,15 +141,24 @@ func cmdRecv(ctx context.Context, args []string, stdout io.Writer) error {
 	ctlFD := c.set.Int("ctl-fd", -1, "")
 	evFD := c.set.Int("event-fd", -1, "")
 	sweep := c.set.Bool("sweep", false, "")
+	report := c.set.Bool("report", false, "")
 	if err := c.parse(args); err != nil {
 		return err
 	}
 	fileMode := c.saw("grant") || c.saw("listen") || c.saw("to") || c.saw("root")
 	if c.saw("sweep") {
-		if !*sweep || fileMode || c.saw("event-fd") || !c.saw("ctl-fd") || *ctlFD < 3 || c.narg() != 0 {
+		// --report, and only --report, takes an event fd.
+		if !*sweep || fileMode || !c.saw("ctl-fd") || *ctlFD < 3 || c.narg() != 0 ||
+			c.saw("report") != c.saw("event-fd") || (c.saw("report") && (!*report || *evFD < 3 || *evFD == *ctlFD)) {
 			return code.New("bad_args")
 		}
-		return recvSweep(ctx, *ctlFD)
+		if !c.saw("report") {
+			*evFD = -1
+		}
+		return recvSweep(ctx, *ctlFD, *evFD)
+	}
+	if c.saw("report") {
+		return code.New("bad_args")
 	}
 	if c.saw("ctl-fd") || c.saw("event-fd") {
 		if fileMode || !c.saw("ctl-fd") || !c.saw("event-fd") || c.narg() != 0 ||
