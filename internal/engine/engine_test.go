@@ -117,6 +117,12 @@ type pipe struct {
 	// ahead of the delay, so a queue builds instead of infinite bandwidth.
 	bps  float64
 	free time.Duration
+	// qcap, with bps, is the bottleneck buffer as queueing delay. A
+	// datagram that would wait longer is tail-dropped.
+	qcap  time.Duration
+	drops int
+	// From stepAt on, delay becomes delay2 (a route change).
+	stepAt, delay2 time.Duration
 }
 
 func newPipe() *pipe { return &pipe{delay: time.Millisecond} }
@@ -139,10 +145,18 @@ func (p *pipe) send(now time.Duration, ds [][]byte) {
 			if p.free > at {
 				at = p.free
 			}
+			if p.qcap > 0 && at-now > p.qcap {
+				p.drops++
+				continue
+			}
 			at += time.Duration(float64(len(d)) / p.bps * 1e9)
 			p.free = at
 		}
-		p.q = append(p.q, queued{at: at + p.delay + extra, d: append([]byte(nil), d...)})
+		delay := p.delay
+		if p.stepAt > 0 && now >= p.stepAt {
+			delay = p.delay2
+		}
+		p.q = append(p.q, queued{at: at + delay + extra, d: append([]byte(nil), d...)})
 	}
 }
 
@@ -1062,5 +1076,193 @@ func TestInflightListBounded(t *testing.T) {
 	small, large := maxLen(3_000_000), maxLen(30_000_000)
 	if large > 2*small+64 {
 		t.Fatalf("in-flight list grew with the file: %d for 3 MB, %d for 30 MB", small, large)
+	}
+}
+
+// A lost retransmission is released on a NACK once it is older than the
+// repair timeout (2*srtt), re-sent, and counted as loss again; it does not
+// sit in flight until contig passes it. The file is long enough that DATA
+// is still flowing, so the NACK path, not the stall probe, repairs it.
+func TestLostRepairReleased(t *testing.T) {
+	file := bytes.Repeat([]byte{4}, 200_000)
+	pr := newPair(t, file, 100, nil)
+	ab := newPipe()
+	sends := 0
+	ab.filt = func(h frame.Header) (bool, time.Duration) {
+		if h.Type != frame.TypeDATA || h.Offset != 5000 {
+			return false, 0
+		}
+		sends++
+		return sends <= 2, 0
+	}
+	mustFinish(t, pr, ab, newPipe())
+	if !bytes.Equal(pr.dst.b, file) || sends < 3 {
+		t.Fatalf("file mismatch or sends %d", sends)
+	}
+	if got := pr.s.pacer.Lost(); got != 200 {
+		t.Fatalf("lost %d bytes, want 200: the original and its repair", got)
+	}
+}
+
+// Receiver rule: a FEEDBACK echoes a send time only when DATA was accepted
+// since the previous FEEDBACK, and 0 otherwise.
+func TestFeedbackEchoOnlyNewData(t *testing.T) {
+	pr := newPair(t, bytes.Repeat([]byte{2}, 1000), 100, nil)
+	key, tok := testMaterial()
+	sess, err := seal.New(key, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Wipe()
+	echoes := func(at time.Duration) []uint64 {
+		pr.r.Pump(at)
+		var out []uint64
+		for _, d := range pr.r.Take() {
+			h, pt, err := sess.Open(d, seal.DirAgent)
+			if err != nil || h.Type != frame.TypeFEEDBACK {
+				continue
+			}
+			f, err := frame.DecodeFeedback(pt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, f.EchoSendTimeNS)
+		}
+		return out
+	}
+	ms := time.Millisecond
+	pr.r.Recv(ms, forge(t, frame.Header{Type: frame.TypeDATA, TransferID: 7, Seq: 1, SendTimeNS: 777}, bytes.Repeat([]byte{2}, 100), seal.DirClient))
+	if e := echoes(ms); len(e) != 1 || e[0] != 777 {
+		t.Fatalf("first FEEDBACK echoes %v, want [777]", e)
+	}
+	if e := echoes(10 * ms); len(e) != 1 || e[0] != 0 {
+		t.Fatalf("FEEDBACK with no new DATA echoes %v, want [0]", e)
+	}
+	pr.r.Recv(11*ms, forge(t, frame.Header{Type: frame.TypeDATA, TransferID: 7, Seq: 2, Offset: 100, SendTimeNS: 999}, bytes.Repeat([]byte{2}, 100), seal.DirClient))
+	if e := echoes(20 * ms); len(e) != 1 || e[0] != 999 {
+		t.Fatalf("FEEDBACK after new DATA echoes %v, want [999]", e)
+	}
+}
+
+// Sender rule: an echo not greater than the last sampled one is not an RTT
+// sample, whatever the receiver sends.
+func TestSenderIgnoresRepeatedEcho(t *testing.T) {
+	pr := newPair(t, bytes.Repeat([]byte{2}, 1000), 100, nil)
+	ms := time.Millisecond
+	seq := uint64(0)
+	fb := func(at time.Duration, echo uint64) {
+		seq++
+		pr.s.Recv(at, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: seq},
+			frame.EncodeFeedback(frame.Feedback{EchoSendTimeNS: echo}), seal.DirAgent))
+	}
+	fb(2*ms, uint64(ms))
+	if !pr.s.haveRTT || pr.s.srtt != ms {
+		t.Fatalf("first echo: srtt %v", pr.s.srtt)
+	}
+	for i := 1; i <= 50; i++ {
+		fb(2*ms+time.Duration(i)*5*ms, uint64(ms))
+	}
+	fb(400*ms, uint64(ms)/2)
+	if pr.s.srtt != ms {
+		t.Fatalf("repeated or older echo moved srtt to %v", pr.s.srtt)
+	}
+	fb(401*ms, uint64(395*ms))
+	if pr.s.srtt == ms {
+		t.Fatal("a newer echo was not sampled")
+	}
+}
+
+// stalledSender is a sender in SENDING with srtt 10 ms, rttvar 0, and the
+// given segments in flight, as if sent and never answered.
+func stalledSender(t *testing.T, segs []sentSeg) *pair {
+	t.Helper()
+	pr := newPair(t, bytes.Repeat([]byte{5}, 10_000), 100, nil)
+	pr.s.state = stSending
+	pr.s.haveRTT = true
+	pr.s.srtt = 10 * time.Millisecond
+	pr.s.inflight = append([]sentSeg(nil), segs...)
+	for _, s := range segs {
+		if s.end > pr.s.nextNew {
+			pr.s.nextNew = s.end
+		}
+	}
+	return pr
+}
+
+// The first probe of a stall is the highest in-flight segment, released
+// from nothing and not counted as loss.
+func TestStallTailProbeFirst(t *testing.T) {
+	pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}, {start: 100, end: 200, n: 100}})
+	w := pr.s.stallWait()
+	if w != 20*time.Millisecond {
+		t.Fatalf("W %v", w)
+	}
+	pr.s.maybeStall(w - time.Millisecond)
+	if len(pr.s.retx) != 0 {
+		t.Fatal("probe before W")
+	}
+	pr.s.maybeStall(w)
+	if len(pr.s.retx) != 1 || pr.s.retx[0] != (frame.Span{Start: 100, End: 200}) {
+		t.Fatalf("tail probe %v", pr.s.retx)
+	}
+	if len(pr.s.inflight) != 2 || pr.s.pacer.Lost() != 0 || pr.s.wholeProbes != 0 {
+		t.Fatalf("tail probe released %d, lost %d", 2-len(pr.s.inflight), pr.s.pacer.Lost())
+	}
+}
+
+// A range probe queues, releases and counts as lost every old segment;
+// a later NACK of the same bytes adds no loss and no duplicate repair.
+func TestStallRangeProbeCountsLoss(t *testing.T) {
+	pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}, {start: 100, end: 200, n: 100}})
+	pr.s.probes = 1
+	now := 2 * time.Second
+	pr.s.maybeStall(now)
+	if pr.s.wholeProbes != 1 || len(pr.s.inflight) != 0 || pr.s.pacer.Lost() != 200 || len(pr.s.retx) != 2 {
+		t.Fatalf("range probe: whole %d inflight %d lost %d retx %v", pr.s.wholeProbes, len(pr.s.inflight), pr.s.pacer.Lost(), pr.s.retx)
+	}
+	pt, err := frame.EncodeNACK([]frame.Span{{Start: 0, End: 200}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr.s.Recv(now+time.Millisecond, forge(t, frame.Header{Type: frame.TypeNACK, TransferID: 7, Seq: 1}, pt, seal.DirAgent))
+	if pr.s.pacer.Lost() != 200 || len(pr.s.retx) != 2 {
+		t.Fatalf("NACK after range probe: lost %d retx %v", pr.s.pacer.Lost(), pr.s.retx)
+	}
+}
+
+// An old segment whose range a younger send overlaps is refused by the
+// repair timeout. It must stay in flight, not be released onto a stalled
+// path, and the sender must wake when the younger send ages out.
+func TestStallRangeProbeReleasesOnlyQueued(t *testing.T) {
+	now := 2 * time.Second
+	young := now - time.Millisecond
+	pr := stalledSender(t, []sentSeg{
+		{start: 0, end: 100, n: 100},
+		{start: 0, end: 100, n: 100, at: young, retx: true},
+	})
+	pr.s.probes = 1
+	pr.s.progAt = 0
+	pr.s.maybeStall(now)
+	if len(pr.s.inflight) != 2 || len(pr.s.retx) != 0 || pr.s.pacer.Lost() != 0 || pr.s.wholeProbes != 0 {
+		t.Fatalf("refused range released: inflight %d retx %v lost %d", len(pr.s.inflight), pr.s.retx, pr.s.pacer.Lost())
+	}
+	if want := young + pr.s.repairTimeout(); pr.s.recheckAt != want {
+		t.Fatalf("recheck at %v, want %v", pr.s.recheckAt, want)
+	}
+}
+
+// Progress resets the backoff: after range probes, a FEEDBACK that
+// advances delivered bytes returns the next stall to the tail probe at W.
+func TestStallBackoffResetsOnProgress(t *testing.T) {
+	pr := stalledSender(t, []sentSeg{{start: 0, end: 100, n: 100}, {start: 100, end: 200, n: 100}})
+	w := pr.s.stallWait()
+	pr.s.probes = 3
+	if got := pr.s.stallWait(); got != 4*time.Second {
+		t.Fatalf("backed-off wait %v", got)
+	}
+	pr.s.Recv(time.Second, forge(t, frame.Header{Type: frame.TypeFEEDBACK, TransferID: 7, Seq: 1},
+		frame.EncodeFeedback(frame.Feedback{DeliveredBytes: 100}), seal.DirAgent))
+	if pr.s.probes != 0 || pr.s.stallWait() != w {
+		t.Fatalf("after progress: probes %d wait %v, want 0 and %v", pr.s.probes, pr.s.stallWait(), w)
 	}
 }

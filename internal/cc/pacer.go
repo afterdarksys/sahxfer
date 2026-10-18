@@ -19,6 +19,15 @@ const (
 	bwRounds = 10
 	// lossBeta is the post-loss reduction for inflight_lo and bw_lo.
 	lossBeta = 0.85
+	// lossThresh is the round loss rate above which a round is a loss
+	// round (BBRv2/v3's 2%).
+	lossThresh = 0.02
+	// lossRounds is how many rounds the loss rate is measured over.
+	lossRounds = 4
+	// startupLossSegs is the least loss, in segments, that ends startup
+	// (BBRv3's full_loss_cnt): a few early drops over a small flight are
+	// a high rate but not a full pipe.
+	startupLossSegs = 6
 	// paceSlack is the most lateness the pacer catches up.
 	paceSlack = time.Millisecond
 )
@@ -79,14 +88,18 @@ type Pacer struct {
 	round       uint64
 	roundDeliv  uint64
 	delivered   uint64
-	lossRound   uint64
-	lossSet     bool
+	roundLost   uint64
+	lossWin     [lossRounds][2]uint64 // lost, delivered per round
+	lossN       int
 	appLimited  bool
 	nextSend    time.Duration
 	phase       int
 	phaseStart  time.Duration
 	probeUntil  time.Duration
+	probeMin    time.Duration // least RTT sample during PROBE_RTT
 	ce          uint64
+	cuts        uint64
+	lostTotal   uint64
 }
 
 // New returns a pacer in startup. mss is the plaintext cap, at least 1.
@@ -110,6 +123,12 @@ func (p *Pacer) Gain() float64 { return p.gain }
 
 // Cap is the inflight byte cap.
 func (p *Pacer) Cap() uint64 { return p.cap }
+
+// LossCuts counts the loss responses that lowered inflight_lo and bw_lo.
+func (p *Pacer) LossCuts() uint64 { return p.cuts }
+
+// Lost is the total newly lost bytes reported through OnLoss and OnECN.
+func (p *Pacer) Lost() uint64 { return p.lostTotal }
 
 // Inflight is bytes sent and not yet filled.
 func (p *Pacer) Inflight() uint64 { return p.inflight }
@@ -188,21 +207,27 @@ func (p *Pacer) OnRTT(rtt, now time.Duration) {
 		p.minRTTAt = now
 		p.haveRTT = true
 	}
+	if p.state == ProbeRTT && (p.probeMin == 0 || rtt < p.probeMin) {
+		p.probeMin = rtt
+	}
 	p.update(now)
 }
 
-// OnLoss applies the once-per-round inflight cap. A second call in the
-// same round does not multiply the cap down again. Startup moves to drain.
-func (p *Pacer) OnLoss(now time.Duration) {
+// OnLoss adds newly lost bytes to the current round. The round's loss
+// rate is judged when it ends (docs/design.md section 6).
+func (p *Pacer) OnLoss(lost uint64, now time.Duration) {
+	p.roundLost += lost
+	p.lostTotal += lost
 	p.update(now)
+}
+
+// cut is the response to a loss round: leave startup, set inflight_lo and
+// bw_lo.
+func (p *Pacer) cut() {
 	if p.state == Startup {
 		p.enterDrain()
 	}
-	if p.lossSet && p.lossRound == p.round {
-		return
-	}
-	p.lossSet = true
-	p.lossRound = p.round
+	p.cuts++
 	lo := uint64(float64(p.inflight) * lossBeta)
 	if b := p.bdp(); b > lo {
 		lo = b
@@ -222,11 +247,12 @@ func (p *Pacer) OnLoss(now time.Duration) {
 	p.cap = p.targetCap()
 }
 
-// OnECN treats an increase in the CE counter as loss.
+// OnECN counts one MSS of loss per new CE mark.
 func (p *Pacer) OnECN(ce uint64, now time.Duration) {
 	if ce > p.ce {
+		n := ce - p.ce
 		p.ce = ce
-		p.OnLoss(now)
+		p.OnLoss(n*p.mss, now)
 	}
 }
 
@@ -276,8 +302,12 @@ func (p *Pacer) update(now time.Duration) {
 		}
 	case ProbeRTT:
 		if now >= p.probeUntil {
-			// The probe is the fresh min-RTT observation. Without this,
-			// the 10s check would re-enter on the next call.
+			// RTprop becomes the least sample taken during the probe, so
+			// it can rise after a route change; its age restarts either
+			// way, or the 10 s check would re-enter on the next call.
+			if p.probeMin > 0 {
+				p.minRTT = p.probeMin
+			}
 			p.minRTTAt = now
 			p.enterProbe(now)
 		}
@@ -290,6 +320,7 @@ func (p *Pacer) update(now time.Duration) {
 			hold = 200 * time.Millisecond
 		}
 		p.probeUntil = now + hold
+		p.probeMin = 0
 		p.cap = 4 * p.mss
 		return
 	}
@@ -317,6 +348,7 @@ func (p *Pacer) advanceRound(now time.Duration) {
 		return
 	}
 	dt := now - p.roundStart
+	p.latest = 0
 	if !p.appLimited && p.delivered > p.roundDeliv {
 		bw := float64(p.delivered-p.roundDeliv) / dt.Seconds()
 		p.latest = bw
@@ -330,6 +362,23 @@ func (p *Pacer) advanceRound(now time.Duration) {
 		}
 		p.noteBW(bw)
 	}
+	p.lossWin[p.lossN%lossRounds] = [2]uint64{p.roundLost, p.delivered - p.roundDeliv}
+	p.lossN++
+	var lost, deliv float64
+	for _, r := range p.lossWin {
+		lost += float64(r[0])
+		deliv += float64(r[1])
+	}
+	// Judge only a full window: lossRounds rounds since the first round
+	// or since the previous loss round, so one noisy round right after a
+	// cut is not judged alone.
+	enough := p.state != Startup || lost >= float64(startupLossSegs*p.mss)
+	if p.lossN >= lossRounds && enough && lost > 0 && lost > lossThresh*(deliv+lost) {
+		p.cut()
+		p.lossWin = [lossRounds][2]uint64{}
+		p.lossN = 0
+	}
+	p.roundLost = 0
 	p.roundStart = now
 	p.roundDeliv = p.delivered
 	p.round++

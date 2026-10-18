@@ -118,6 +118,7 @@ type Peer struct {
 
 	seq        uint64
 	srtt       time.Duration
+	rttvar     time.Duration
 	haveRTT    bool
 	out        [][]byte
 	unpaced    bool
@@ -134,15 +135,22 @@ type Peer struct {
 	rxPingSent bool
 	rePinged   bool
 
-	nextNew        uint64
-	contig         uint64
-	retx           []frame.Span
-	inflight       []sentSeg
-	flushAt        time.Duration
-	lastFIN        time.Duration
-	finQueued      bool
-	nackSinceFlush bool
-	tailProbed     bool
+	nextNew  uint64
+	contig   uint64
+	retx     []frame.Span
+	inflight []sentSeg
+	// progAt is the last advance of contig or FEEDBACK delivered bytes,
+	// or the last stall probe. probes counts stall probes since progress.
+	progAt    time.Duration
+	probes    uint
+	fbDeliv   uint64
+	recheckAt time.Duration
+	// noStall turns the stall probe off; tests use it as a baseline.
+	noStall bool
+	// wholeProbes counts stall probes that resent a range (not a TLP).
+	wholeProbes int
+	lastFIN     time.Duration
+	finQueued   bool
 
 	lastNACK    time.Duration
 	nackSig     uint64
@@ -287,7 +295,7 @@ func (p *Peer) Pump(now time.Duration) {
 	if p.cfg.Sender {
 		p.maybeRePing(now)
 		p.maybePing(now)
-		p.maybeTail(now)
+		p.maybeStall(now)
 		if p.state == stFlushing || p.state == stDone {
 			p.maybeFIN(now)
 		}
@@ -404,10 +412,15 @@ func (p *Peer) WakeAt(now time.Duration) time.Duration {
 		}
 	}
 	if p.cfg.Sender && (p.state == stFlushing || p.state == stDone) {
-		consider(p.lastFIN + p.rtt())
-		if p.state == stFlushing && !p.tailProbed {
-			consider(p.flushAt + 2*p.rtt())
+		if !p.finQueued {
+			// The first FIN is due as soon as FLUSHING starts.
+			return now
 		}
+		consider(p.lastFIN + p.rtt())
+	}
+	if p.cfg.Sender && p.stalling() && !p.noStall {
+		consider(p.stallStart() + p.stallWait())
+		consider(p.recheckAt)
 	}
 	if !p.cfg.Sender {
 		if !p.fbSent {
@@ -537,10 +550,17 @@ func (p *Peer) noteRTT(rtt, now time.Duration) {
 	if rtt <= 0 {
 		return
 	}
+	// RFC 6298: rttvar from the previous srtt, then srtt.
 	if !p.haveRTT {
 		p.srtt = rtt
+		p.rttvar = rtt / 2
 		p.haveRTT = true
 	} else {
+		d := p.srtt - rtt
+		if d < 0 {
+			d = -d
+		}
+		p.rttvar = (3*p.rttvar + d) / 4
 		p.srtt = (7*p.srtt + rtt) / 8
 	}
 	if p.pacer != nil {
@@ -682,23 +702,129 @@ func (p *Peer) enterFlush(now time.Duration) {
 		return
 	}
 	p.state = stFlushing
-	p.flushAt = now
 }
 
-func (p *Peer) maybeTail(now time.Duration) {
-	if p.state != stFlushing || p.tailProbed || p.nackSinceFlush {
+// stalling reports segments in flight above contig with nothing queued
+// for repair: only a stall probe can recover them if they are all lost.
+func (p *Peer) stalling() bool {
+	if p.state != stSending && p.state != stFlushing {
+		return false
+	}
+	return len(p.inflight) > 0 && p.contig < p.nextNew && len(p.retx) == 0
+}
+
+// stallStart is the later of the last progress and the oldest in-flight
+// send. The list is in send order.
+func (p *Peer) stallStart() time.Duration {
+	start := p.progAt
+	if len(p.inflight) > 0 && p.inflight[0].at > start {
+		start = p.inflight[0].at
+	}
+	return start
+}
+
+// stallWait is W = 2*max(srtt + 4*rttvar, FeedbackFloor) before the tail
+// probe (1 s before the first RTT sample), then max(2*W, 1 s) before a
+// range probe, doubled per range probe without progress, at most 8 s.
+// docs/design.md section 4.5.
+func (p *Peer) stallWait() time.Duration {
+	w := time.Second
+	if p.haveRTT {
+		w = p.srtt + 4*p.rttvar
+		if w < cc.FeedbackFloor {
+			w = cc.FeedbackFloor
+		}
+		w *= 2
+	}
+	if p.probes == 0 {
+		return w
+	}
+	w *= 2
+	if w < time.Second {
+		w = time.Second
+	}
+	for i := uint(1); i < p.probes && w < 8*time.Second; i++ {
+		w *= 2
+	}
+	if w > 8*time.Second {
+		w = 8 * time.Second
+	}
+	return w
+}
+
+// progress records an advance of contig or FEEDBACK delivered bytes. The
+// next stall starts again at the tail probe.
+func (p *Peer) progress(now time.Duration) {
+	p.progAt = now
+	p.probes = 0
+	p.recheckAt = 0
+}
+
+// maybeStall is the stall probe (docs/design.md section 4.5). First a
+// tail probe: the highest in-flight segment once, not a loss signal. If
+// that brings no progress, a range probe: every segment older than the
+// repair timeout is queued again, released, and counted as lost.
+func (p *Peer) maybeStall(now time.Duration) {
+	if p.noStall || !p.stalling() || now < p.recheckAt {
 		return
 	}
-	if p.contig >= p.cfg.Size {
+	if now-p.stallStart() < p.stallWait() {
 		return
 	}
-	if now-p.flushAt < 2*p.rtt() {
+	if p.probes == 0 {
+		hi := p.inflight[0]
+		for _, s := range p.inflight[1:] {
+			if s.end > hi.end {
+				hi = s
+			}
+		}
+		p.retx = append(p.retx, frame.Span{Start: hi.start, End: hi.end})
+		p.probes = 1
+		p.progAt = now
 		return
 	}
-	p.tailProbed = true
-	sp := frame.Span{Start: p.contig, End: p.cfg.Size}
-	p.releaseForRetx(sp, now)
-	p.queueRetx(sp, now)
+	win := p.repairTimeout()
+	release := make([]bool, len(p.inflight))
+	var lost uint64
+	var retry time.Duration
+	for i, s := range p.inflight {
+		if now-s.at < win {
+			continue
+		}
+		sp := frame.Span{Start: s.start, End: s.end}
+		if p.queueRetx(sp, now) {
+			lost += sp.End - sp.Start
+			release[i] = true
+		} else if p.queued(sp) {
+			release[i] = true
+		} else if at := p.recentUntil(sp, now); retry == 0 || at < retry {
+			retry = at
+		}
+	}
+	if lost == 0 {
+		// Every old range is refused by a younger overlapping send: wake
+		// when that send ages out.
+		p.recheckAt = retry
+		return
+	}
+	var n uint64
+	keep := p.inflight[:0]
+	for i, s := range p.inflight {
+		if release[i] {
+			n += s.n
+			continue
+		}
+		keep = append(keep, s)
+	}
+	p.inflight = keep
+	if p.pacer != nil {
+		p.pacer.OnFilled(n, now)
+		p.pacer.OnLoss(lost, now)
+	}
+	p.wholeProbes++
+	p.probes++
+	p.progAt = now
+	p.recheckAt = 0
 }
 
 func (p *Peer) maybeFIN(now time.Duration) {
@@ -709,13 +835,18 @@ func (p *Peer) maybeFIN(now time.Duration) {
 	if p.closeAck {
 		flags = frame.FlagCloseAck
 	}
-	if p.send(now, frame.Header{Type: frame.TypeFIN, Flags: flags, Offset: p.cfg.Size}, nil) {
-		p.finQueued = true
-		p.lastFIN = now
+	if !p.send(now, frame.Header{Type: frame.TypeFIN, Flags: flags, Offset: p.cfg.Size}, nil) {
+		// Only a spent sequence space fails a send: a wrap aborts the
+		// grant, and WakeAt cannot keep returning now for a FIN.
+		p.abort(now, frame.ReasonProtocol)
+		return
 	}
+	p.finQueued = true
+	p.lastFIN = now
 }
 
-func (p *Peer) queueRetx(sp frame.Span, now time.Duration) {
+// queueRetx queues sp for repair and reports whether it did.
+func (p *Peer) queueRetx(sp frame.Span, now time.Duration) bool {
 	if sp.End > p.nextNew {
 		sp.End = p.nextNew
 	}
@@ -723,27 +854,40 @@ func (p *Peer) queueRetx(sp frame.Span, now time.Duration) {
 		sp.Start = p.contig
 	}
 	if sp.Start >= sp.End {
-		return
+		return false
 	}
 	if p.recent(sp, now) {
-		return
+		return false
 	}
-	for _, q := range p.retx {
-		if q.Start == sp.Start && q.End == sp.End {
-			return
-		}
+	if p.queued(sp) {
+		return false
 	}
 	p.retx = append(p.retx, sp)
+	return true
 }
 
+// queued reports sp wholly inside ranges already queued for repair, such
+// as a NACK hole inside a range probe's ranges.
+func (p *Peer) queued(sp frame.Span) bool {
+	return covered(sp, p.retx) == sp.End-sp.Start
+}
+
+// recent reports a send overlapping sp within the repair timeout, 2*srtt.
 func (p *Peer) recent(sp frame.Span, now time.Duration) bool {
-	win := p.rtt()
+	return p.recentUntil(sp, now) > now
+}
+
+// recentUntil is when the youngest send overlapping sp ages past the
+// repair timeout, or 0 if none is that young.
+func (p *Peer) recentUntil(sp frame.Span, now time.Duration) time.Duration {
+	win := p.repairTimeout()
+	var until time.Duration
 	for _, s := range p.inflight {
-		if s.start < sp.End && s.end > sp.Start && now-s.at < win {
-			return true
+		if s.start < sp.End && s.end > sp.Start && now-s.at < win && s.at+win > until {
+			until = s.at + win
 		}
 	}
-	return false
+	return until
 }
 
 func (p *Peer) noteContig(c uint64, now time.Duration) {
@@ -754,6 +898,7 @@ func (p *Peer) noteContig(c uint64, now time.Duration) {
 	if c <= p.contig {
 		return
 	}
+	p.progress(now)
 	// Filled segments leave the list, so it holds only what is in flight
 	// and a scan costs the window, not the file.
 	var filled uint64
@@ -873,31 +1018,78 @@ func (p *Peer) onNACK(now time.Duration, h frame.Header, pt []byte) {
 		p.abort(now, frame.ReasonProtocol)
 		return
 	}
-	p.nackSinceFlush = true
 	p.noteContig(h.Offset, now)
+	// Newly lost bytes are the NACKed bytes not queued for repair and not
+	// covered by a retransmission within the repair timeout. A re-NACK of a
+	// hole under repair adds nothing; an older repair is released and
+	// counts again.
 	var lost uint64
 	for _, sp := range holes {
-		lost += sp.End - sp.Start
-	}
-	// Cut the cap while the lost originals are still in flight, then drop
-	// those originals so the repair segment fits. A retx stays in flight
-	// until the range is contiguous; a later NACK must not cancel it.
-	if p.pacer != nil && lost > 0 {
-		p.pacer.OnLoss(now)
-	}
-	for _, sp := range holes {
 		p.releaseForRetx(sp, now)
+		lost += p.uncovered(sp)
 		p.queueRetx(sp, now)
+	}
+	if p.pacer != nil && lost > 0 {
+		p.pacer.OnLoss(lost, now)
 	}
 }
 
-// releaseForRetx takes original sends of sp out of the inflight count.
-// Retransmissions stay until noteContig covers them.
+// uncovered is the bytes of sp outside every queued repair and every
+// retransmission still in flight.
+func (p *Peer) uncovered(sp frame.Span) uint64 {
+	cov := append([]frame.Span(nil), p.retx...)
+	for _, s := range p.inflight {
+		if s.retx {
+			cov = append(cov, frame.Span{Start: s.start, End: s.end})
+		}
+	}
+	return sp.End - sp.Start - covered(sp, cov)
+}
+
+// covered is how many bytes of sp lie inside the union of spans.
+func covered(sp frame.Span, spans []frame.Span) uint64 {
+	var cov []frame.Span
+	for _, c := range spans {
+		if c.Start < sp.Start {
+			c.Start = sp.Start
+		}
+		if c.End > sp.End {
+			c.End = sp.End
+		}
+		if c.Start < c.End {
+			cov = append(cov, c)
+		}
+	}
+	sort.Slice(cov, func(i, j int) bool { return cov[i].Start < cov[j].Start })
+	var n uint64
+	at := sp.Start
+	for _, c := range cov {
+		if c.End <= at {
+			continue
+		}
+		if c.Start < at {
+			c.Start = at
+		}
+		n += c.End - c.Start
+		at = c.End
+	}
+	return n
+}
+
+// repairTimeout is 2*srtt. A NACK shows the receiver as it was a one-way
+// delay ago, and queueing can hold a repair past srtt; a repair younger
+// than this is not presumed lost and its range is not sent again.
+func (p *Peer) repairTimeout() time.Duration { return 2 * p.rtt() }
+
+// releaseForRetx takes original sends of sp out of the inflight count,
+// and retransmissions of sp older than the repair timeout, which are
+// presumed lost. A younger retransmission stays until noteContig covers it.
 func (p *Peer) releaseForRetx(sp frame.Span, now time.Duration) {
 	var n uint64
+	win := p.repairTimeout()
 	keep := p.inflight[:0]
 	for _, s := range p.inflight {
-		if !s.retx && s.start >= sp.Start && s.end <= sp.End {
+		if (!s.retx || now-s.at >= win) && s.start >= sp.Start && s.end <= sp.End {
 			n += s.n
 			continue
 		}
@@ -929,10 +1121,13 @@ func (p *Peer) onFeedback(now time.Duration, h frame.Header, pt []byte) {
 		if d > p.nextNew {
 			d = p.nextNew
 		}
-		p.pacer.Sample(d, now)
-		if f.NewlyLostBytes > 0 {
-			p.pacer.OnLoss(now)
+		if d > p.fbDeliv {
+			p.fbDeliv = d
+			p.progress(now)
 		}
+		p.pacer.Sample(d, now)
+		// newly_lost_bytes names the holes a NACK names; the NACK path
+		// counts them once (docs/design.md section 6).
 		if f.ECNCECount > 0 {
 			p.pacer.OnECN(f.ECNCECount, now)
 		}
@@ -1036,9 +1231,11 @@ func (p *Peer) onPong(now time.Duration, h frame.Header, pt []byte) {
 	}
 	if p.cfg.Size == 0 || p.nextNew >= p.cfg.Size {
 		p.enterFlush(now)
+		p.progress(now)
 		return
 	}
 	p.state = stSending
+	p.progress(now)
 }
 
 func (p *Peer) maybeNACK(now time.Duration) {
@@ -1054,8 +1251,8 @@ func (p *Peer) maybeNACK(now time.Duration) {
 	}
 	// Mature is oldest first, so the cut keeps the oldest holes. Any accept
 	// that ends inside a hole, including one that starts inside it,
-	// re-births the remainder above it, so age is not offset order, and a NACK lists its holes in offset order
-	// (PROTOCOL 4.1).
+	// re-births the remainder above it, so age is not offset order. A
+	// NACK lists its holes in offset order (PROTOCOL 4.1).
 	sort.Slice(mature, func(i, j int) bool { return mature[i].Start < mature[j].Start })
 	var nb uint64
 	for _, h := range mature {
@@ -1106,7 +1303,8 @@ func (p *Peer) maybeFeedback(now time.Duration) {
 	if now > p.start {
 		rate = uint64(float64(p.holes.Delivered()) / (now - p.start).Seconds())
 	}
-	// Echo only DATA accepted since the previous FEEDBACK.
+	// The echo is the highest-sequence DATA ever accepted, sent only when
+	// some DATA was accepted since the previous FEEDBACK.
 	var echo uint64
 	if p.dataSinceFB > 0 {
 		echo = p.highSent

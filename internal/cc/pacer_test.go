@@ -29,20 +29,83 @@ func TestInitialWindowAndPace(t *testing.T) {
 	}
 }
 
-func TestLossCutsOncePerRound(t *testing.T) {
-	p := New(100)
-	p.OnSend(1000, 0)
-	p.OnLoss(0)
-	if p.State() != Drain || p.Gain() != drainGain {
-		t.Fatalf("state %s gain %v", p.State(), p.Gain())
+// steps drives FEEDBACK arrivals one FeedbackFloor apart.
+type steps struct {
+	p   *Pacer
+	now time.Duration
+	del uint64
+}
+
+func (s *steps) step(bytes uint64) {
+	s.del += bytes
+	s.now += FeedbackFloor
+	s.p.Sample(s.del, s.now)
+}
+
+// newSteps starts the first round, then ends lossRounds-1 growing rounds
+// (2.5, 5, 10 MB/s) so startup holds and the next round fills the loss
+// window.
+func newSteps(mss uint64) *steps {
+	p := New(mss)
+	p.OnRTT(50*time.Microsecond, 0)
+	s := &steps{p: p}
+	s.step(1) // the first FEEDBACK starts the first round
+	for _, b := range []uint64{12_500, 25_000, 50_000} {
+		s.step(b)
 	}
-	cap := p.Cap()
-	if cap != 850 {
-		t.Fatalf("cap %d", cap)
+	return s
+}
+
+// A loss round is judged when the round ends: several losses in one round
+// cut once. Startup needs startupLossSegs lost segments as well as the rate.
+func TestLossRound(t *testing.T) {
+	s := newSteps(1000)
+	s.p.OnSend(100_000, s.now)
+	// 5 segments over a full window of 187.5 KB is 2.6%: above the rate
+	// threshold, under startupLossSegs, so startup holds.
+	s.p.OnLoss(5000, s.now)
+	s.step(100_000)
+	if s.p.State() != Startup || s.p.LossCuts() != 0 {
+		t.Fatalf("5 segments at 2.6%% ended startup: %s cuts %d", s.p.State(), s.p.LossCuts())
 	}
-	p.OnLoss(0)
-	if p.Cap() != cap {
-		t.Fatalf("cut twice: %d then %d", cap, p.Cap())
+	for i := 0; i < 4; i++ {
+		s.p.OnLoss(2000, s.now)
+	}
+	if s.p.LossCuts() != 0 {
+		t.Fatal("cut before the round ended")
+	}
+	s.step(100_000)
+	if s.p.State() != Drain || s.p.Gain() != drainGain || s.p.LossCuts() != 1 {
+		t.Fatalf("state %s gain %v cuts %d", s.p.State(), s.p.Gain(), s.p.LossCuts())
+	}
+	if s.p.Cap() != 85_000 {
+		t.Fatalf("cap %d, want 0.85 * inflight", s.p.Cap())
+	}
+	if s.p.Lost() != 13_000 {
+		t.Fatalf("lost %d", s.p.Lost())
+	}
+}
+
+// Past startup, 1% loss is below the 2% threshold measured over
+// lossRounds rounds and never cuts; 3% does.
+func TestLossThreshold(t *testing.T) {
+	s := newSteps(1000)
+	s.p.enterDrain()
+	for i := 0; i < 40; i++ {
+		s.p.OnLoss(1000, s.now)
+		s.step(100_000)
+	}
+	if s.p.LossCuts() != 0 {
+		t.Fatalf("1%% loss cut %d times", s.p.LossCuts())
+	}
+	// Measured over lossRounds rounds, so a steady 3% cuts within that
+	// many rounds, and once.
+	for i := 0; i < lossRounds; i++ {
+		s.p.OnLoss(3000, s.now)
+		s.step(100_000)
+	}
+	if s.p.LossCuts() != 1 {
+		t.Fatalf("3%% loss cut %d times", s.p.LossCuts())
 	}
 }
 
@@ -64,7 +127,7 @@ func TestStartupExitsWhenBandwidthStalls(t *testing.T) {
 func TestProbeBWCycle(t *testing.T) {
 	p := New(100)
 	p.OnRTT(time.Millisecond, 0)
-	p.OnLoss(0)
+	p.enterDrain()
 	if !p.CanSend(0, 100) {
 		t.Fatal("send")
 	}
@@ -99,16 +162,22 @@ func TestProbeRTT(t *testing.T) {
 	}
 }
 
+// Each new CE mark counts one MSS of loss in the round.
 func TestECNIsLoss(t *testing.T) {
-	p := New(100)
-	p.OnSend(500, 0)
-	p.OnECN(0, 0)
-	if p.State() != Startup {
-		t.Fatal(p.State())
+	s := newSteps(1000)
+	s.p.OnSend(50_000, s.now)
+	s.p.OnECN(0, s.now)
+	if s.p.Lost() != 0 {
+		t.Fatal(s.p.Lost())
 	}
-	p.OnECN(3, 0)
-	if p.State() != Drain {
-		t.Fatal(p.State())
+	s.p.OnECN(7, s.now)
+	s.p.OnECN(7, s.now)
+	if s.p.Lost() != 7000 {
+		t.Fatalf("lost %d", s.p.Lost())
+	}
+	s.step(50_000)
+	if s.p.State() != Drain {
+		t.Fatal(s.p.State())
 	}
 }
 
@@ -190,71 +259,90 @@ func TestBandwidthUnderJitter(t *testing.T) {
 	}
 }
 
-// bw_max is a windowed max: a high sample ages out after bwRounds rounds.
+// bw_max is a windowed max: a high sample holds for bwRounds-1 later
+// sampled rounds and ages out on the next.
 func TestBandwidthDecays(t *testing.T) {
-	p := New(1000)
-	p.OnRTT(50*time.Microsecond, 0)
-	var del uint64
-	now := time.Duration(0)
-	step := func(bytes uint64) {
-		del += bytes
-		now += FeedbackFloor
-		p.Sample(del, now)
+	s := newSteps(1000)
+	s.step(100_000) // 20 MB/s
+	high := 100_000 / FeedbackFloor.Seconds()
+	low := 10_000 / FeedbackFloor.Seconds()
+	for i := 0; i < bwRounds-1; i++ {
+		s.step(10_000) // 2 MB/s
 	}
-	step(1)
-	step(100_000) // 20 MB/s
-	for i := 0; i < bwRounds; i++ {
-		step(10_000) // 2 MB/s
+	if s.p.bw < high*0.99 {
+		t.Fatalf("bw %v aged out before %d rounds", s.p.bw, bwRounds)
 	}
-	if want := 10_000 / FeedbackFloor.Seconds(); p.bw > want*1.01 {
-		t.Fatalf("bw %v did not decay to %v", p.bw, want)
+	s.step(10_000)
+	if s.p.bw > low*1.01 {
+		t.Fatalf("bw %v did not decay to %v", s.p.bw, low)
 	}
 }
 
-// Loss keeps inflight_lo and bw_lo until PROBE_BW completes a cycle.
+// lossState cuts once: 100 KB in flight, 10 segments lost in a round.
+func lossState(t *testing.T) *steps {
+	t.Helper()
+	s := newSteps(1000)
+	s.step(100_000) // 20 MB/s, cap 2*20e6*5ms = 200 KB
+	s.p.OnSend(100_000, s.now)
+	s.p.OnLoss(10_000, s.now)
+	s.step(100_000)
+	if s.p.LossCuts() != 1 || s.p.inflightLo != 85_000 || s.p.Cap() != 85_000 {
+		t.Fatalf("cuts %d inflight_lo %d cap %d", s.p.LossCuts(), s.p.inflightLo, s.p.Cap())
+	}
+	s.p.OnFilled(100_000, s.now)
+	if s.p.State() != ProbeBW || s.p.phase != 0 {
+		t.Fatalf("state %s phase %d", s.p.State(), s.p.phase)
+	}
+	return s
+}
+
+// Loss keeps inflight_lo and bw_lo through phases 1..7 and clears them
+// exactly when the cycle wraps to the 1.25 phase.
 func TestLossLowHoldsUntilProbe(t *testing.T) {
-	p := New(1000)
-	p.OnRTT(50*time.Microsecond, 0)
-	var del uint64
-	now := time.Duration(0)
-	step := func(bytes uint64) {
-		del += bytes
-		now += FeedbackFloor
-		p.Sample(del, now)
+	s := lossState(t)
+	for i := 1; i < len(probeGains); i++ {
+		s.step(100_000)
+		if s.p.phase != i || s.p.inflightLo != 85_000 || s.p.bwLo == 0 || s.p.Cap() != 85_000 {
+			t.Fatalf("step %d: phase %d inflight_lo %d bw_lo %v cap %d", i, s.p.phase, s.p.inflightLo, s.p.bwLo, s.p.Cap())
+		}
 	}
-	step(1)
-	step(100_000) // 20 MB/s, cap 2*20e6*5ms = 200 KB
-	p.OnSend(100_000, now)
-	p.OnLoss(now)
-	if p.inflightLo != 85_000 || p.Cap() != 85_000 {
-		t.Fatalf("inflight_lo %d cap %d", p.inflightLo, p.Cap())
+	s.step(100_000)
+	if s.p.phase != 0 || s.p.inflightLo != 0 || s.p.bwLo != 0 || s.p.Cap() != 200_000 {
+		t.Fatalf("at the wrap: phase %d inflight_lo %d bw_lo %v cap %d", s.p.phase, s.p.inflightLo, s.p.bwLo, s.p.Cap())
 	}
-	p.OnFilled(100_000, now)
-	if p.State() != ProbeBW {
-		t.Fatalf("state %s", p.State())
+}
+
+// PROBE_RTT -> PROBE_BW enters phase 0 without completing a cycle, so the
+// loss state stays.
+func TestLossLowSurvivesProbeRTT(t *testing.T) {
+	s := lossState(t)
+	at := 10*time.Second + FeedbackFloor
+	s.p.CanSend(at, 1000)
+	if s.p.State() != ProbeRTT {
+		t.Fatalf("state %s", s.p.State())
 	}
-	step(100_000)
-	if p.Cap() != 85_000 || p.bwLo == 0 {
-		t.Fatalf("lo cleared before a probe: cap %d bw_lo %v", p.Cap(), p.bwLo)
+	s.p.CanSend(at+200*time.Millisecond, 1000)
+	if s.p.State() != ProbeBW || s.p.phase != 0 {
+		t.Fatalf("state %s phase %d", s.p.State(), s.p.phase)
 	}
-	for i := 0; i < len(probeGains)+1 && p.inflightLo != 0; i++ {
-		step(100_000)
+	if s.p.inflightLo != 85_000 || s.p.bwLo == 0 || s.p.Cap() != 85_000 {
+		t.Fatalf("PROBE_RTT exit cleared the loss state: inflight_lo %d bw_lo %v cap %d", s.p.inflightLo, s.p.bwLo, s.p.Cap())
 	}
-	if p.inflightLo != 0 || p.bwLo != 0 || p.Cap() <= 85_000 {
-		t.Fatalf("lo not cleared after a cycle: cap %d lo %d bw_lo %v", p.Cap(), p.inflightLo, p.bwLo)
-	}
+}
+
+// pacedAt10MB is a pacer in PROBE_BW at 10 MB/s with nothing in flight.
+func pacedAt10MB() (*Pacer, time.Duration) {
+	s := newSteps(1000)
+	s.step(50_000) // 10 MB/s
+	s.p.enterDrain()
+	s.p.CanSend(s.now, 1000) // drain exits into PROBE_BW
+	return s.p, s.now
 }
 
 // A runner that wakes 200 us late on every send still sends at the pacing
 // rate: the next slot is scheduled from the previous slot.
 func TestPacingAbsorbsLateWakeups(t *testing.T) {
-	p := New(1000)
-	p.OnRTT(50*time.Microsecond, 0)
-	p.Sample(1, 0)
-	p.Sample(50_001, FeedbackFloor) // 10 MB/s
-	p.OnLoss(FeedbackFloor)         // leave startup's 2.89 gain
-	p.OnFilled(1<<40, FeedbackFloor)
-	start := 2 * FeedbackFloor
+	p, start := pacedAt10MB()
 	now := start
 	sent := 0
 	for now < start+100*time.Millisecond {
@@ -267,8 +355,83 @@ func TestPacingAbsorbsLateWakeups(t *testing.T) {
 		now = p.WakeAt(now) + 200*time.Microsecond
 	}
 	rate := float64(sent*1000) / 0.1
-	want := p.Gain() * p.estBW()
-	if rate < 0.9*want {
-		t.Fatalf("sent %.0f B/s, pacing rate %.0f B/s", rate, want)
+	if want := 10e6; rate < 0.9*want {
+		t.Fatalf("sent %.0f B/s, pacing rate about %.0f B/s", rate, want)
+	}
+}
+
+// burstAt sends one segment at t0, then counts the segments that may leave
+// at once when the runner wakes late past the next slot.
+func burstAt(t *testing.T, late time.Duration) (int, time.Duration) {
+	t.Helper()
+	p, t0 := pacedAt10MB()
+	p.OnSend(1000, t0)
+	p.OnFilled(1000, t0)
+	now := p.WakeAt(t0) + late
+	iv := p.interval(1000)
+	n := 0
+	for p.CanSend(now, 1000) {
+		p.OnSend(1000, now)
+		p.OnFilled(1000, now)
+		n++
+		if n > 1000 {
+			t.Fatal("unbounded burst")
+		}
+	}
+	return n, iv
+}
+
+// 0.9 ms late: catch up at most about 1 ms of data plus one segment.
+func TestPacingLateBurstLimit(t *testing.T) {
+	n, iv := burstAt(t, 900*time.Microsecond)
+	most := int(time.Millisecond/iv) + 1
+	least := int(900 * time.Microsecond / iv)
+	if n > most || n < least {
+		t.Fatalf("0.9 ms late sent %d segments, want %d..%d (slot %v)", n, least, most, iv)
+	}
+}
+
+// More than 1 ms behind means idle: one segment, then a paced gap.
+func TestPacingNoCreditAfterIdle(t *testing.T) {
+	if n, _ := burstAt(t, 1500*time.Microsecond); n != 1 {
+		t.Fatalf("1.5 ms late sent %d segments, want 1", n)
+	}
+	p, t0 := pacedAt10MB()
+	p.OnSend(1000, t0)
+	p.OnFilled(1000, t0)
+	now := t0 + 5*time.Millisecond
+	if !p.CanSend(now, 1000) {
+		t.Fatal("no send after idle")
+	}
+	p.OnSend(1000, now)
+	p.OnFilled(1000, now)
+	if p.CanSend(now, 1000) {
+		t.Fatal("idle gave credit: a second segment at the same instant")
+	}
+	if w := p.WakeAt(now); w <= now {
+		t.Fatalf("no gap after the first segment: wake %v now %v", w, now)
+	}
+}
+
+// RTprop can rise: PROBE_RTT ends with the least sample taken during it.
+// A route change from 100 ms to 500 ms otherwise keeps 100 ms forever.
+func TestRTpropRisesAfterProbeRTT(t *testing.T) {
+	p := New(1000)
+	p.OnRTT(100*time.Millisecond, 0)
+	p.CanSend(10*time.Second, 1000)
+	if p.State() != ProbeRTT {
+		t.Fatalf("state %s", p.State())
+	}
+	p.OnRTT(520*time.Millisecond, 10*time.Second+50*time.Millisecond)
+	p.OnRTT(500*time.Millisecond, 10*time.Second+100*time.Millisecond)
+	p.CanSend(10*time.Second+200*time.Millisecond, 1000)
+	if p.State() != ProbeBW || p.minRTT != 500*time.Millisecond {
+		t.Fatalf("state %s RTprop %v, want 500ms", p.State(), p.minRTT)
+	}
+	// No sample during the probe: RTprop stays, its age restarts.
+	p.CanSend(20*time.Second+200*time.Millisecond, 1000)
+	p.CanSend(20*time.Second+800*time.Millisecond, 1000)
+	if p.State() != ProbeBW || p.minRTT != 500*time.Millisecond {
+		t.Fatalf("state %s RTprop %v", p.State(), p.minRTT)
 	}
 }
