@@ -1,143 +1,109 @@
 package grant
 
-// Threats: a helper that keeps writing after the control plane has
-// withdrawn the grant, a put lease presented to a get, and a signature
-// from a key the agent does not pin. The signature is checked before any
-// field in the payload is trusted. Deadline equality is expired.
+// Threats: a lease payload that two builders (Go here and in the agent,
+// Node in the server) encode differently, so a field the signer did not
+// mean to bind passes; a field that smuggles a newline and shifts every
+// later line; and the key material reaching the signer. The payload binds
+// every field the agent or recv acts on, and the key only as a hash.
+// The lease envelope (systemapi-lease-v1) is verified by the agent, not
+// here. docs/golden-xfer-lease-v2.txt is the shared vector.
 
 import (
-	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afterdarksys/sahxfer/internal/code"
+	"github.com/afterdarksys/sahxfer/internal/seal"
 )
 
-const (
-	// LeaseTTL is the signature lifetime. Renew uses the same window.
-	LeaseTTL = 60 * time.Second
-	// LeaseRenew is how often the caller asks for a new signature.
-	LeaseRenew = 30 * time.Second
-)
+const materialLabel = "sahxfer-material-v1\n"
 
-// Sign builds an 8-line payload and signs it with the control-plane key.
-// Deadline is now plus LeaseTTL for both start and renew.
-func Sign(priv ed25519.PrivateKey, g *Grant, kind string, now time.Time) (msg, sig []byte, deadline time.Time, err error) {
-	if g == nil || len(priv) != ed25519.PrivateKeySize {
-		return nil, nil, time.Time{}, code.New("auth")
-	}
-	if kind != "start" && kind != "renew" {
-		return nil, nil, time.Time{}, code.New("auth")
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	deadline = now.Add(LeaseTTL)
-	msg = payload(g.GrantID, deadline.Unix(), kind, g.Dir, g.Root, g.Path, g.Size, g.Hash)
-	return msg, ed25519.Sign(priv, msg), deadline, nil
-}
-
-// Verify checks the signature, then the deadline, then that the payload
-// names this grant. A mismatch other than the deadline is auth.
-func Verify(pub ed25519.PublicKey, g *Grant, msg, sig []byte, now time.Time) error {
-	if g == nil || len(pub) != ed25519.PublicKeySize {
-		return code.New("auth")
-	}
-	if !ed25519.Verify(pub, msg, sig) {
-		return code.New("auth")
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	id, dl, kind, dir, root, path, size, sum, err := parseLease(msg)
-	if err != nil {
-		return err
-	}
-	if now.Unix() >= dl {
-		return code.New("expired")
-	}
-	if kind != "start" && kind != "renew" {
-		return code.New("auth")
-	}
-	want, err := leaseDir(g)
-	if err != nil {
-		return err
-	}
-	if id != g.GrantID || dir != want || dir != g.Dir || root != g.Root || path != g.Path || size != g.Size || !SameHash(sum, g.Hash) {
-		return code.New("auth")
-	}
-	return nil
-}
-
-func leaseDir(g *Grant) (string, error) {
-	switch g.Purpose {
-	case PurposePut:
-		if g.Dir != "put" {
-			return "", code.New("auth")
-		}
-	case PurposeGet:
-		if g.Dir != "get" {
-			return "", code.New("auth")
-		}
-	case PurposeRoot:
-		if g.Dir != "put" && g.Dir != "get" {
-			return "", code.New("auth")
-		}
-	default:
+// Material is hex(sha256("sahxfer-material-v1\n" || key || token)) over the
+// raw 32-byte key and 16-byte route token.
+func Material(key, token []byte) (string, error) {
+	if len(key) != seal.KeySize || len(token) != seal.TokenSize {
 		return "", code.New("auth")
 	}
-	return g.Dir, nil
+	h := sha256.New()
+	h.Write([]byte(materialLabel))
+	h.Write(key)
+	h.Write(token)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func payload(id string, deadline int64, kind, dir, root, path string, size uint64, sum [32]byte) []byte {
-	s := fmt.Sprintf("%s\n%d\n%s\n%s\n%s\n%s\n%d\n%s",
-		id, deadline, kind, dir, root, path, size, hex.EncodeToString(sum[:]))
-	return []byte(s)
-}
-
-func parseLease(msg []byte) (id string, deadline int64, kind, dir, root, path string, size uint64, sum [32]byte, err error) {
-	n := 0
-	for _, c := range msg {
-		if c == '\n' {
-			n++
+// Payload is the 18-line xfer lease payload: lines joined by "\n", no
+// trailing newline. phase is start or renew. peer is listen or
+// dial:<host:port>. material is the 64-hex Material value. The expiry
+// line is FirstBy. A control byte or newline in any field is bad_grant.
+func Payload(g *Grant, deadline time.Time, phase, peer, material string) (string, error) {
+	if g == nil {
+		return "", code.New("internal")
+	}
+	if phase != "start" && phase != "renew" {
+		return "", code.New("bad_grant")
+	}
+	if g.Dir != "put" && g.Dir != "get" {
+		return "", code.New("bad_purpose")
+	}
+	if peer != "listen" {
+		if !strings.HasPrefix(peer, "dial:") || checkAddr(peer[len("dial:"):]) != nil {
+			return "", code.New("bad_grant")
 		}
 	}
-	if n != 7 {
-		return "", 0, "", "", "", "", 0, sum, code.New("auth")
+	if len(material) != 64 {
+		return "", code.New("bad_grant")
 	}
-	lines := split8(msg)
-	if lines == nil {
-		return "", 0, "", "", "", "", 0, sum, code.New("auth")
+	if _, err := ParseHash(material); err != nil {
+		return "", err
 	}
-	dl, perr := strconv.ParseInt(lines[1], 10, 64)
-	if perr != nil {
-		return "", 0, "", "", "", "", 0, sum, code.New("auth")
+	if !grantID.MatchString(g.GrantID) || g.TransferID == 0 || !g.HaveHash {
+		return "", code.New("bad_grant")
 	}
-	sz, perr := ParseUint(lines[6])
-	if perr != nil {
-		return "", 0, "", "", "", "", 0, sum, code.New("auth")
+	if g.Idle <= 0 || g.Max <= 0 || g.Idle > g.Max || g.Max > 3600*time.Second || g.ByteCap < g.Size {
+		return "", code.New("mismatch")
 	}
-	sum, perr = ParseHash(lines[7])
-	if perr != nil {
-		return "", 0, "", "", "", "", 0, sum, code.New("auth")
+	ow := "0"
+	if g.Overwrite {
+		ow = "1"
 	}
-	return lines[0], dl, lines[2], lines[3], lines[4], lines[5], sz, sum, nil
-}
-
-func split8(msg []byte) []string {
-	out := make([]string, 0, 8)
-	start := 0
-	for i, c := range msg {
-		if c == '\n' {
-			out = append(out, string(msg[start:i]))
-			start = i + 1
+	lines := []string{
+		g.GrantID,
+		strconv.FormatInt(deadline.Unix(), 10),
+		phase,
+		g.Dir,
+		g.Root,
+		g.Path,
+		strconv.FormatUint(g.Size, 10),
+		hex.EncodeToString(g.Hash[:]),
+		ow,
+		TransferHex(g.TransferID),
+		strconv.FormatInt(g.FirstBy.Unix(), 10),
+		strconv.FormatInt(int64(g.Idle/time.Second), 10),
+		strconv.FormatInt(int64(g.Max/time.Second), 10),
+		strconv.FormatUint(g.ByteCap, 10),
+		g.Profile,
+		g.Transport,
+		peer,
+		material,
+	}
+	for _, l := range lines {
+		if l == "" {
+			return "", code.New("bad_grant")
+		}
+		for i := 0; i < len(l); i++ {
+			if l[i] < 0x20 || l[i] == 0x7f {
+				return "", code.New("bad_grant")
+			}
 		}
 	}
-	out = append(out, string(msg[start:]))
-	if len(out) != 8 {
-		return nil
-	}
-	return out
+	return strings.Join(lines, "\n"), nil
+}
+
+// TransferHex is the 16 lowercase hex digit form of a transfer id.
+func TransferHex(id uint64) string {
+	s := strconv.FormatUint(id, 16)
+	return strings.Repeat("0", 16-len(s)) + s
 }

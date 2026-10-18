@@ -165,7 +165,10 @@ func TestNewRefuses(t *testing.T) {
 		base, bearer, origin, key, want string
 	}{
 		{"https://127.0.0.1:9", testBearer, "https://127.0.0.1:9", testAPIKey, "auth"},
-		{"http://127.0.0.1:9", testBearer, "http://127.0.0.1:9", "", "auth"},
+		{"http://localhost:3103", testBearer, "http://localhost:3103", "", "auth"},
+		{"http://192.0.2.1", testBearer, "http://192.0.2.1", "", "auth"},
+		{"http://example.com", testBearer, "http://example.com", "", "auth"},
+		{"ftp://127.0.0.1:9", testBearer, "x", "", "auth"},
 		{"https://metadata.google.internal", testBearer, "x", "", "auth"},
 		{"https://metadata.goog", testBearer, "x", "", "auth"},
 		{"https://169.254.169.254", testBearer, "x", "", "auth"},
@@ -653,4 +656,109 @@ func (f roundFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f
 
 func roundTrip(f func(*http.Request) (*http.Response, error)) http.RoundTripper {
 	return roundFunc(f)
+}
+
+// Plain http works only to a loopback IP literal. localhost and any other
+// origin are refused before a request is sent.
+func TestLoopbackHTTP(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Header.Get("X-API-Key") != testAPIKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"host_id":"h1","hostname":"web1","status":"online"}`))
+	}))
+	defer srv.Close()
+	if !strings.HasPrefix(srv.URL, "http://127.0.0.1:") {
+		t.Fatalf("server %s", srv.URL)
+	}
+	c, err := New(srv.URL, "", "", testAPIKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := c.Resolve(context.Background(), "web1")
+	if err != nil || h.HostID != "h1" {
+		t.Fatal(h, err)
+	}
+	u, _ := url.Parse(srv.URL)
+	for _, base := range []string{
+		"http://localhost:" + u.Port(),
+		"http://192.0.2.1:" + u.Port(),
+	} {
+		c.Base = base
+		before := hits.Load()
+		_, err := c.Resolve(context.Background(), "web1")
+		codeIs(t, err, "auth")
+		if hits.Load() != before {
+			t.Fatalf("%s was sent", base)
+		}
+	}
+}
+
+// Codes on the closed list pass through. Anything else is request_failed.
+func TestErrorList(t *testing.T) {
+	pass := []string{
+		"unauthorized", "bearer_required", "query_key_rejected", "forbidden",
+		"sso_unbound", "oauth_unavailable", "registry_unavailable",
+		"bad_request", "bad_purpose", "bad_root", "bad_path", "reserved_name",
+		"too_large", "invalid_name", "scope_denied", "root_denied", "not_found",
+		"ambiguous", "rate_limited", "cap_reached", "agent_offline",
+		"agent_unsupported", "pty_user_unset", "root_unavailable", "exists",
+		"symlink_refused", "not_a_file", "changed", "no_space", "internal", "io",
+		"auth", "expired", "mismatch", "bad_grant",
+	}
+	for _, c := range pass {
+		if err := errorCode([]byte(`{"error":"` + c + `"}`)); err == nil || err.Error() != c {
+			t.Fatalf("%s: %v", c, err)
+		}
+	}
+	for _, c := range []string{"client_gone", "payload_mismatch", "lease_required", "nope", ""} {
+		if err := errorCode([]byte(`{"error":"` + c + `"}`)); err == nil || err.Error() != "request_failed" {
+			t.Fatalf("%s: %v", c, err)
+		}
+	}
+}
+
+// An HTTP grant: expires_at is 60 s after issue (expires_in 60) and
+// max_seconds is 3600. The hard stop is near issue plus 3600 s, not 60 s.
+func TestGrantHardStopFromIssue(t *testing.T) {
+	now := time.Now()
+	b := goodBody(now)
+	b.ExpiresAt = now.Add(60 * time.Second).UTC().Format(time.RFC3339Nano)
+	b.ExpiresIn = json.RawMessage("60")
+	g, err := decodeGrant(mustJSON(t, b), goodReq(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Wipe()
+	if d := g.HardStop.Sub(now); d < 3599*time.Second || d > 3600*time.Second {
+		t.Fatalf("hard stop %s", d)
+	}
+	if d := g.FirstBy.Sub(now); d < 59*time.Second || d > 60*time.Second {
+		t.Fatalf("first by %s", d)
+	}
+	_, max, first, err := g.RunLimits(now)
+	if err != nil || max < 3599*time.Second || first > 60*time.Second {
+		t.Fatalf("max %s first %s %v", max, first, err)
+	}
+	// Issue 50 minutes ago by expires_at minus expires_in: 10 minutes left.
+	b.ExpiresAt = now.Add(10 * time.Second).UTC().Format(time.RFC3339Nano)
+	b.ExpiresIn = json.RawMessage("3010")
+	g2, err := decodeGrant(mustJSON(t, b), goodReq(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Wipe()
+	if d := g2.HardStop.Sub(now); d < 599*time.Second || d > 600*time.Second {
+		t.Fatalf("late hard stop %s", d)
+	}
+	// A hard stop already past is expired.
+	b.ExpiresAt = now.Add(10 * time.Second).UTC().Format(time.RFC3339Nano)
+	b.ExpiresIn = json.RawMessage("3600")
+	b.Max = 60
+	b.Idle = 30
+	_, err = decodeGrant(mustJSON(t, b), goodReq(now))
+	codeIs(t, err, "expired")
 }

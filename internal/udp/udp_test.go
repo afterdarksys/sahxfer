@@ -326,3 +326,121 @@ func loopbackThroughput(t *testing.T, size int, late, bound time.Duration) {
 	}
 	t.Logf("%d bytes in %v (%.1f MB/s)", size, took, float64(size)/took.Seconds()/1e6)
 }
+
+// A forged datagram from another source reaches the listener first. It does
+// not open, so it must not pin that source, and the real sender completes.
+func TestForgedFirstDatagramDoesNotPin(t *testing.T) {
+	file := bytes.Repeat([]byte("f"), 4000)
+	e := newEnds(t, file, 0)
+	rxc := listen(t)
+	defer rxc.Close()
+	forger := dial(t, rxc.LocalAddr())
+	defer forger.Close()
+	other, err := seal.New(bytes.Repeat([]byte("X"), seal.KeySize), bytes.Repeat([]byte("T"), seal.TokenSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := other.Seal(frame.Header{Type: frame.TypePING, Seq: 1, TransferID: 7}, nil, seal.DirClient)
+	other.Wipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var calls int
+	errc := make(chan error, 1)
+	go func() {
+		errc <- Run(ctx, Config{Peer: e.r, Conn: rxc, Progress: func(uint64) { calls++ }})
+	}()
+	for _, d := range [][]byte{[]byte("junk"), forged} {
+		if _, err := forger.Write(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	txc := dial(t, rxc.LocalAddr())
+	defer txc.Close()
+	txErr := Run(ctx, Config{Peer: e.s, Conn: txc, Connected: true})
+	rxErr := <-errc
+	if txErr != nil || rxErr != nil {
+		t.Fatalf("tx=%v rx=%v", txErr, rxErr)
+	}
+	if e.commits != 1 || !bytes.Equal(e.dst.b, file) || calls < 1 {
+		t.Fatalf("commits=%d n=%d progress=%d", e.commits, len(e.dst.b), calls)
+	}
+}
+
+// A done context cancels the peer and sends one ABORT cancelled, so the
+// other side stops within an RTT instead of idling out.
+func TestCancelSendsAbort(t *testing.T) {
+	e := newEnds(t, bytes.Repeat([]byte("a"), 50000), 0)
+	var sClean, rClean int
+	e.s.SetHooks(engine.Hooks{Cleanup: func() { sClean++ }})
+	e.r.SetHooks(engine.Hooks{Cleanup: func() { rClean++ }})
+	rxc := listen(t)
+	defer rxc.Close()
+	txc := dial(t, rxc.LocalAddr())
+	defer txc.Close()
+	noData := func(d []byte) bool { return len(d) >= frame.HeaderSize && d[5] == frame.TypeDATA }
+	rctx, rcancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- Run(rctx, Config{Peer: e.r, Conn: rxc, Filter: noData}) }()
+	tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer tcancel()
+	txc2 := make(chan error, 1)
+	go func() { txc2 <- Run(tctx, Config{Peer: e.s, Conn: txc, Connected: true}) }()
+	time.Sleep(200 * time.Millisecond)
+	rcancel()
+	if err := <-errc; err != context.Canceled {
+		t.Fatalf("rx %v", err)
+	}
+	err := <-txc2
+	ae, ok := err.(*engine.AbortError)
+	if !ok || ae.Reason != frame.ReasonCancelled {
+		t.Fatalf("tx %v", err)
+	}
+	if sClean != 1 || rClean != 1 {
+		t.Fatalf("cleans=%d,%d", sClean, rClean)
+	}
+}
+
+// 100 datagrams with a valid header and a wrong route token reach the
+// listener before the real sender. Unpinned failures spend no budget, so
+// the grant survives and the transfer completes.
+func TestBadDatagramsBeforePinDoNotKill(t *testing.T) {
+	file := bytes.Repeat([]byte("b"), 4000)
+	e := newEnds(t, file, 0)
+	rxc := listen(t)
+	defer rxc.Close()
+	forger := dial(t, rxc.LocalAddr())
+	defer forger.Close()
+	key, _ := testMaterial()
+	other, err := seal.New(key, bytes.Repeat([]byte("W"), seal.TokenSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- Run(ctx, Config{Peer: e.r, Conn: rxc}) }()
+	for i := 1; i <= 100; i++ {
+		d, err := other.Seal(frame.Header{Type: frame.TypeDATA, Seq: uint64(i), TransferID: 7}, []byte("x"), seal.DirClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := forger.Write(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other.Wipe()
+	time.Sleep(50 * time.Millisecond)
+	txc := dial(t, rxc.LocalAddr())
+	defer txc.Close()
+	txErr := Run(ctx, Config{Peer: e.s, Conn: txc, Connected: true})
+	if rxErr := <-errc; txErr != nil || rxErr != nil {
+		t.Fatalf("tx=%v rx=%v", txErr, rxErr)
+	}
+	if e.commits != 1 || !bytes.Equal(e.dst.b, file) {
+		t.Fatalf("commits=%d n=%d", e.commits, len(e.dst.b))
+	}
+}

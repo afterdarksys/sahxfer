@@ -173,10 +173,23 @@ func parseBase(raw string) (*url.URL, error) {
 	if u.User != nil {
 		return nil, code.New("bad_args")
 	}
-	if !strings.EqualFold(u.Scheme, "https") || badName(u.Hostname()) {
+	if !secureScheme(u) || badName(u.Hostname()) {
 		return nil, code.New("auth")
 	}
 	return u, nil
+}
+
+// secureScheme is https, or http to a loopback IP literal. localhost is
+// refused, because it resolves through the resolver.
+func secureScheme(u *url.URL) bool {
+	if strings.EqualFold(u.Scheme, "https") {
+		return true
+	}
+	if !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 // Resolve is GET /api/v1/hosts/resolve. The name must match the host label
@@ -311,7 +324,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 	if err != nil {
 		return nil, err
 	}
-	if !strings.EqualFold(u.Scheme, "https") {
+	if !secureScheme(u) {
 		return nil, code.New("auth")
 	}
 	ref, err := u.Parse(path)
@@ -379,12 +392,29 @@ func mapDo(err error) error {
 	return code.New("request_failed")
 }
 
+// allowErr is the closed list of server codes passed through verbatim.
+// Anything else is request_failed.
 var allowErr = map[string]bool{
-	"bad_purpose": true, "bad_root": true, "bad_path": true, "scope_denied": true,
-	"root_denied": true, "not_found": true, "exists": true, "too_large": true,
-	"rate_limited": true, "agent_offline": true, "agent_unsupported": true,
-	"cap_reached": true, "internal": true, "changed": true, "symlink_refused": true,
-	"reserved_name": true, "not_a_file": true, "ambiguous": true, "invalid_name": true,
+	// Auth.
+	"unauthorized": true, "bearer_required": true, "query_key_rejected": true,
+	"forbidden": true, "sso_unbound": true, "oauth_unavailable": true,
+	"registry_unavailable": true,
+	// Request shape.
+	"bad_request": true, "bad_purpose": true, "bad_root": true, "bad_path": true,
+	"reserved_name": true, "too_large": true, "invalid_name": true,
+	// Authority.
+	"scope_denied": true, "root_denied": true, "not_found": true, "ambiguous": true,
+	// Capacity.
+	"rate_limited": true, "cap_reached": true,
+	// Host.
+	"agent_offline": true, "agent_unsupported": true, "pty_user_unset": true,
+	"root_unavailable": true,
+	// Target.
+	"exists": true, "symlink_refused": true, "not_a_file": true, "changed": true,
+	"no_space": true,
+	// Server.
+	"internal": true, "io": true,
+	// Already local in the client.
 	"auth": true, "expired": true, "mismatch": true, "bad_grant": true,
 }
 
@@ -430,7 +460,8 @@ func decodeGrant(raw []byte, req GrantRequest) (*grant.Grant, error) {
 	if err := dec.Decode(&doc); err != nil || dec.More() {
 		return nil, code.New("bad_grant")
 	}
-	if err := expiresIn(doc.ExpiresIn); err != nil {
+	expIn, err := expiresIn(doc.ExpiresIn)
+	if err != nil {
 		return nil, err
 	}
 	if uint64(doc.Size) >= 1<<63 || uint64(doc.ByteCap) >= 1<<63 {
@@ -489,6 +520,21 @@ func decodeGrant(raw []byte, req GrantRequest) (*grant.Grant, error) {
 	if !exp.After(now) {
 		return nil, code.New("expired")
 	}
+	// expires_at is the first-packet deadline. The hard stop is issue plus
+	// max_seconds, issue being expires_at minus expires_in. Issue is not in
+	// the future, so the hard stop is clamped to now plus max_seconds.
+	// Without expires_in, issue is taken as now.
+	max := time.Duration(doc.Max) * time.Second
+	hard := now.Add(max)
+	if expIn > 0 {
+		if h := exp.Add(-expIn).Add(max); h.Before(hard) {
+			hard = h
+		}
+	}
+	first := exp
+	if first.After(hard) {
+		first = hard
+	}
 	id, err := parseTransfer(doc.TransferID)
 	if err != nil {
 		return nil, err
@@ -508,9 +554,9 @@ func decodeGrant(raw []byte, req GrantRequest) (*grant.Grant, error) {
 		Size: size, Hash: sum, HaveHash: true, Overwrite: doc.Overwrite,
 		Profile: doc.Profile, Transport: doc.Transport,
 		PeerUDP: deref(doc.Peer.UDP), PeerQUIC: deref(doc.Peer.QUIC),
-		AEAD: doc.AEAD, Key: key, Token: tok, Expires: exp,
+		AEAD: doc.AEAD, Key: key, Token: tok, FirstBy: first, HardStop: hard,
 		Idle:    time.Duration(doc.Idle) * time.Second,
-		Max:     time.Duration(doc.Max) * time.Second,
+		Max:     max,
 		ByteCap: capn,
 	}
 	if err := g.Check(now); err != nil {
@@ -520,21 +566,21 @@ func decodeGrant(raw []byte, req GrantRequest) (*grant.Grant, error) {
 	return g, nil
 }
 
-func expiresIn(raw json.RawMessage) error {
+func expiresIn(raw json.RawMessage) (time.Duration, error) {
 	if len(raw) == 0 {
-		return nil
+		return 0, nil
 	}
 	if string(raw) == "null" {
-		return code.New("bad_grant")
+		return 0, code.New("bad_grant")
 	}
 	n, err := grant.ParseUint(string(raw))
 	if err != nil {
-		return code.New("bad_grant")
+		return 0, code.New("bad_grant")
 	}
 	if n < 1 || n > 3600 {
-		return code.New("mismatch")
+		return 0, code.New("mismatch")
 	}
-	return nil
+	return time.Duration(n) * time.Second, nil
 }
 
 func parseTransfer(s string) (uint64, error) {

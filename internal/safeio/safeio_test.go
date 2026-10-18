@@ -18,7 +18,7 @@ func TestOpenAndCommit(t *testing.T) {
 	r := mustRoot(t, root)
 	defer r.Close()
 
-	tmp, err := r.CreateTemp("rel/app.bin", "xfr_abc", false)
+	tmp, err := r.CreateTemp("rel/app.bin", "xfr_abcdefgh", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestOpenAndCommit(t *testing.T) {
 	if !bytes.Equal(got, []byte("payload")) {
 		t.Fatalf("body %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(root, "rel", ".sahxfer-xfr_abc.part")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "rel", ".sahxfer-xfr_abcdefgh.part")); !os.IsNotExist(err) {
 		t.Fatal("temp name still present")
 	}
 
@@ -69,7 +69,7 @@ func TestExistsLeavesTarget(t *testing.T) {
 	}
 	r := mustRoot(t, root)
 	defer r.Close()
-	_, err := r.CreateTemp("app.bin", "xfr_abc", false)
+	_, err := r.CreateTemp("app.bin", "xfr_abcdefgh", false)
 	if err == nil || err.Error() != "exists" {
 		t.Fatalf("got %v", err)
 	}
@@ -77,7 +77,7 @@ func TestExistsLeavesTarget(t *testing.T) {
 	if err != nil || string(got) != "keep" {
 		t.Fatalf("target changed %q %v", got, err)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".sahxfer-xfr_abc.part")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, ".sahxfer-xfr_abcdefgh.part")); !os.IsNotExist(err) {
 		t.Fatal("temp created")
 	}
 }
@@ -105,11 +105,11 @@ func TestSymlinkRefused(t *testing.T) {
 	if err == nil || err.Error() != "symlink_refused" {
 		t.Fatalf("file symlink %v", err)
 	}
-	_, err = r.CreateTemp("filelink", "xfr_abc", true)
+	_, err = r.CreateTemp("filelink", "xfr_abcdefgh", true)
 	if err == nil || err.Error() != "symlink_refused" {
 		t.Fatalf("create through symlink %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(other, ".sahxfer-xfr_abc.part")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(other, ".sahxfer-xfr_abcdefgh.part")); !os.IsNotExist(err) {
 		t.Fatal("wrote through symlink")
 	}
 
@@ -146,7 +146,7 @@ func TestPathAndFifo(t *testing.T) {
 	if err == nil || err.Error() != "bad_path" {
 		t.Fatalf("grant id %v", err)
 	}
-	_, err = r.CreateTemp(".", "xfr_abc", false)
+	_, err = r.CreateTemp(".", "xfr_abcdefgh", false)
 	if err == nil || err.Error() != "not_a_file" {
 		t.Fatalf("dot %v", err)
 	}
@@ -159,7 +159,7 @@ func TestPathAndFifo(t *testing.T) {
 	if err == nil || err.Error() != "not_a_file" {
 		t.Fatalf("fifo %v", err)
 	}
-	_, err = r.CreateTemp("pipe", "xfr_abc", true)
+	_, err = r.CreateTemp("pipe", "xfr_abcdefgh", true)
 	if err == nil || err.Error() != "not_a_file" {
 		t.Fatalf("fifo create %v", err)
 	}
@@ -254,4 +254,30 @@ func mustRoot(t *testing.T, path string) *safeio.Root {
 		t.Fatal(err)
 	}
 	return r
+}
+
+// A target created after the temp, before the commit, is not replaced
+// without overwrite: exists, and the target keeps its bytes.
+func TestCommitRaceKeepsTarget(t *testing.T) {
+	root := physDir(t)
+	r := mustRoot(t, root)
+	defer r.Close()
+	tmp, err := r.CreateTemp("app.bin", "xfr_race0001", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Remove()
+	if _, err := tmp.File.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "app.bin")
+	if err := os.WriteFile(target, []byte("racer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmp.Commit(false); err == nil || err.Error() != "exists" {
+		t.Fatalf("commit %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "racer" {
+		t.Fatalf("target %q %v", got, err)
+	}
 }

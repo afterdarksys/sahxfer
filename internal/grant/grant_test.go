@@ -2,8 +2,6 @@ package grant
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -149,8 +147,8 @@ func TestIssueDefaults(t *testing.T) {
 	if g.Idle != 30*time.Second || g.Max != 3600*time.Second || g.ByteCap != g.Size {
 		t.Fatalf("limits")
 	}
-	if !g.Expires.Equal(in.Now.Add(g.Max)) {
-		t.Fatalf("expires %s", g.Expires)
+	if !g.HardStop.Equal(in.Now.Add(g.Max)) || !g.FirstBy.Equal(g.HardStop) {
+		t.Fatalf("expires %s %s", g.FirstBy, g.HardStop)
 	}
 	in.PeerUDP = "[::1]:9"
 	g2 := mustIssue(t, in)
@@ -230,11 +228,11 @@ func TestRunnableAndLimits(t *testing.T) {
 	in.Expires = in.Now.Add(10 * time.Second)
 	g = mustIssue(t, in)
 	defer g.Wipe()
-	idle, max, err := g.RunLimits(in.Now)
-	if err != nil || idle != 30*time.Second || max != 10*time.Second {
-		t.Fatalf("%s %s %v", idle, max, err)
+	idle, max, first, err := g.RunLimits(in.Now)
+	if err != nil || idle != 30*time.Second || max != 3600*time.Second || first != 10*time.Second {
+		t.Fatalf("%s %s %s %v", idle, max, first, err)
 	}
-	_, _, err = g.RunLimits(g.Expires)
+	_, _, _, err = g.RunLimits(g.FirstBy)
 	if !codeIs(err, "expired") {
 		t.Fatal(err)
 	}
@@ -289,10 +287,10 @@ func TestFileRoundTrip(t *testing.T) {
 	if _, err := Read(link, in.Now); !codeIs(err, "symlink_refused") {
 		t.Fatal(err)
 	}
-	if _, _, err := g.RunLimits(g.Expires); !codeIs(err, "expired") {
+	if _, _, _, err := g.RunLimits(g.FirstBy); !codeIs(err, "expired") {
 		t.Fatal(err)
 	}
-	if _, err := Read(path, g.Expires); !codeIs(err, "expired") {
+	if _, err := Read(path, g.FirstBy); !codeIs(err, "expired") {
 		t.Fatal(err)
 	}
 }
@@ -379,82 +377,6 @@ func TestCheckShortKey(t *testing.T) {
 	defer g.Wipe()
 	g.Key = g.Key[:16]
 	if err := g.Check(putReq().Now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-}
-
-func TestLease(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Unix(1_700_000_000, 0).UTC()
-	g := mustIssue(t, putReq())
-	defer g.Wipe()
-	msg, sig, dl, err := Sign(priv, g, "start", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !dl.Equal(now.Add(LeaseTTL)) {
-		t.Fatal(dl)
-	}
-	if err := Verify(pub, g, msg, sig, now); err != nil {
-		t.Fatal(err)
-	}
-	_, sig2, _, err := Sign(priv, g, "renew", now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	renew := payload(g.GrantID, dl.Unix(), "renew", g.Dir, g.Root, g.Path, g.Size, g.Hash)
-	if err := Verify(pub, g, renew, sig2, now); err != nil {
-		t.Fatal(err)
-	}
-	bad := append([]byte(nil), sig...)
-	bad[0] ^= 0xff
-	if err := Verify(pub, g, msg, bad, now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	if err := Verify(pub, g, msg, sig, dl); !codeIs(err, "expired") {
-		t.Fatal(err)
-	}
-	if err := Verify(pub, g, msg, sig, dl.Add(-time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := Verify(pub[:16], g, msg, sig, now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	if _, _, _, err := Sign(priv[:32], g, "start", now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	if err := Verify(pub, nil, msg, sig, now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-
-	in := putReq()
-	in.Purpose, in.Dir, in.Scopes = PurposeGet, "get", Scopes{Read: true}
-	getg := mustIssue(t, in)
-	defer getg.Wipe()
-	putMsg := payload(getg.GrantID, now.Add(LeaseTTL).Unix(), "start", "put", getg.Root, getg.Path, getg.Size, getg.Hash)
-	if err := Verify(pub, getg, putMsg, ed25519.Sign(priv, putMsg), now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	kind := payload(g.GrantID, now.Add(LeaseTTL).Unix(), "nope", g.Dir, g.Root, g.Path, g.Size, g.Hash)
-	if err := Verify(pub, g, kind, ed25519.Sign(priv, kind), now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	upper := payload(g.GrantID, now.Add(LeaseTTL).Unix(), "start", g.Dir, g.Root, g.Path, g.Size, g.Hash)
-	lines := strings.Split(string(upper), "\n")
-	lines[7] = strings.ToUpper(lines[7])
-	upper = []byte(strings.Join(lines, "\n"))
-	if err := Verify(pub, g, upper, ed25519.Sign(priv, upper), now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	moved := append(append([]byte(nil), msg...), '\n')
-	if err := Verify(pub, g, moved, ed25519.Sign(priv, moved), now); !codeIs(err, "auth") {
-		t.Fatal(err)
-	}
-	late := payload(g.GrantID, now.Unix(), "start", g.Dir, g.Root, g.Path, g.Size, g.Hash)
-	if err := Verify(pub, g, late, ed25519.Sign(priv, late), now); !codeIs(err, "expired") {
 		t.Fatal(err)
 	}
 }

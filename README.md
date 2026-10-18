@@ -17,6 +17,10 @@ sahxfer get --url https://sah.example --root /srv/app --token <token> web1:/srv/
 
 A finished command writes three lines to stdout: the grant id, the transfer id as 16 hex digits, and `ok`. Stderr is a code. The process does not print the bearer, the API key, the grant key, the route token, or file bytes.
 
+`recv --ctl-fd 3 --event-fd 4` is the mode the host agent spawns, as the host user, after it has verified the lease. It is refused with `--grant`, `--listen`, `--to`, or `--root`. Fd 3 carries one JSON grant line (unknown fields refused, 64 KiB cap), then `renew` and `cancel` lines; EOF on fd 3 is cancel. Fd 4 carries `ready`, `active`, and one final `result` line, never the key or the route token. `recv` stops itself at the lease deadline it was given unless a renew moves it forward. Stdout and stderr keep the contract above. `recv --sweep --ctl-fd 3` reads `{root, path, grant_id}` and removes only that grant's `.sahxfer-<grant_id>.part`. `PROTOCOL.md` §1.1 has the lines.
+
+`--url` accepts `https://`, or `http://` only to a loopback IP literal such as `http://127.0.0.1:3103`. `localhost` is refused.
+
 ## What this is
 
 One regular file, one direction, one grant. The control client asks the hub to authorize the host, the root, the path, the size, and the hash (`GET /api/v1/hosts/resolve`, `POST /api/v1/xfer/grant`). That server is not in this repo. After the grant, file bytes do not travel on the WebSocket the agent already uses for shells and for `sahsync`.

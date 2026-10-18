@@ -5,9 +5,9 @@
 // caller, and a commit that replaces an existing target when overwrite is
 // false. Linux uses openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|
 // RESOLVE_NO_MAGICLINKS and renameat2(RENAME_NOREPLACE). Darwin walks one
-// component at a time with O_NOFOLLOW. That walk is not openat2. Darwin has
-// no renameat2, so a file created after the exists check and before rename
-// can be replaced. A kernel without openat2 is agent_unsupported. There is
+// component at a time with O_NOFOLLOW. That walk is not openat2. Darwin
+// commits with renameatx_np(RENAME_EXCL) when overwrite is false. A
+// kernel without openat2 is agent_unsupported. There is
 // no fallback. This package does not drop uid: Go cannot drop privileges on
 // one goroutine. The agent must spawn the helper as pty_user.
 //
@@ -170,6 +170,34 @@ func (t *Temp) Remove() error {
 	return nil
 }
 
+// RemoveTemp deletes .sahxfer-<grant_id>.part in the parent of rel, and
+// nothing else. The name is fixed by the grant id, so a sweep after a crash
+// cannot be aimed at another file. An absent temp is not an error.
+func (r *Root) RemoveTemp(rel, grantID string) error {
+	if r == nil || r.fd < 0 {
+		return code.New("bad_root")
+	}
+	if !validGrantID(grantID) {
+		return code.New("bad_path")
+	}
+	dirs, _, err := pathx.Parent(rel)
+	if err != nil {
+		return err
+	}
+	parent, err := r.walk(dirs)
+	if err != nil {
+		if e, ok := err.(*code.Error); ok && e.C == "not_found" {
+			return nil
+		}
+		return err
+	}
+	defer closefd(parent)
+	if err := unlinkAt(parent, ".sahxfer-"+grantID+".part"); err != nil && !isAbsent(err) {
+		return code.New("io")
+	}
+	return nil
+}
+
 func (r *Root) walk(dirs []string) (int, error) {
 	parent, err := dupfd(r.fd)
 	if err != nil {
@@ -186,8 +214,9 @@ func (r *Root) walk(dirs []string) (int, error) {
 	return parent, nil
 }
 
+// validGrantID is ^xfr_[A-Za-z0-9_-]{8,64}$, the grant package's rule.
 func validGrantID(id string) bool {
-	if len(id) < 5 || len(id) > 80 || !strings.HasPrefix(id, "xfr_") {
+	if len(id) < 4+8 || len(id) > 4+64 || !strings.HasPrefix(id, "xfr_") {
 		return false
 	}
 	for i := 4; i < len(id); i++ {

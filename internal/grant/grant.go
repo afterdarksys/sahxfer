@@ -53,12 +53,13 @@ type Request struct {
 	HostID    string
 	PeerUDP   string
 	PeerQUIC  string
-	Expires   time.Time
-	Idle      time.Duration
-	Max       time.Duration
-	ByteCap   uint64
-	Now       time.Time
-	Scopes    Scopes
+	// Expires is the first-packet deadline (expires_at). Zero is Now plus Max.
+	Expires time.Time
+	Idle    time.Duration
+	Max     time.Duration
+	ByteCap uint64
+	Now     time.Time
+	Scopes  Scopes
 }
 
 // Grant is one file, one direction. Key and Token are memory copies.
@@ -82,10 +83,13 @@ type Grant struct {
 	AEAD       string
 	Key        []byte
 	Token      []byte
-	Expires    time.Time
-	Idle       time.Duration
-	Max        time.Duration
-	ByteCap    uint64
+	// FirstBy is expires_at, the first-packet deadline. HardStop is issue
+	// plus max_seconds. A transfer may run past FirstBy, never past HardStop.
+	FirstBy  time.Time
+	HardStop time.Time
+	Idle     time.Duration
+	Max      time.Duration
+	ByteCap  uint64
 }
 
 // CheckScopes is the purpose, direction, and scope matrix.
@@ -197,13 +201,17 @@ func Issue(in Request) (*Grant, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	g.HardStop = now.Add(g.Max)
 	if in.Expires.IsZero() {
-		g.Expires = now.Add(g.Max)
+		g.FirstBy = g.HardStop
 	} else {
-		g.Expires = in.Expires
+		g.FirstBy = in.Expires
 	}
-	if !g.Expires.After(now) {
+	if !g.FirstBy.After(now) {
 		return nil, code.New("expired")
+	}
+	if g.FirstBy.After(g.HardStop) {
+		g.FirstBy = g.HardStop
 	}
 	if err := g.fillRand(); err != nil {
 		g.Wipe()
@@ -344,7 +352,7 @@ func (g *Grant) Check(now time.Time) error {
 	if g.ByteCap < g.Size {
 		return code.New("mismatch")
 	}
-	if !g.Expires.After(now) {
+	if !g.FirstBy.After(now) || !g.HardStop.After(now) {
 		return code.New("expired")
 	}
 	return nil
@@ -455,27 +463,32 @@ func (g *Grant) Runnable() error {
 	}
 }
 
-// RunLimits shortens the hard stop to the grant expiry.
-// max <= 0 is expired. The caller shrinks Idle when it is longer than max.
-func (g *Grant) RunLimits(now time.Time) (idle, max time.Duration, err error) {
+// RunLimits is the engine's idle, hard stop, and first-packet window from
+// now. max is Max shortened to HardStop. first is FirstBy minus now, at
+// most max. A passed FirstBy or HardStop is expired. The caller shrinks
+// Idle when it is longer than max.
+func (g *Grant) RunLimits(now time.Time) (idle, max, first time.Duration, err error) {
 	if g == nil {
-		return 0, 0, code.New("internal")
+		return 0, 0, 0, code.New("internal")
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if !g.Expires.After(now) {
-		return 0, 0, code.New("expired")
+	if !g.HardStop.After(now) || !g.FirstBy.After(now) {
+		return 0, 0, 0, code.New("expired")
 	}
-	until := g.Expires.Sub(now)
 	max = g.Max
-	if until < max {
+	if until := g.HardStop.Sub(now); until < max {
 		max = until
 	}
-	if max <= 0 {
-		return 0, 0, code.New("expired")
+	first = g.FirstBy.Sub(now)
+	if first > max {
+		first = max
 	}
-	return g.Idle, max, nil
+	if max <= 0 || first <= 0 {
+		return 0, 0, 0, code.New("expired")
+	}
+	return g.Idle, max, first, nil
 }
 
 // Wipe zeros the key and the route token. It does not wipe copies the

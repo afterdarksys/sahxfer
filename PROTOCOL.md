@@ -15,13 +15,25 @@ POST /api/v1/xfer/grant
 
 The grant request names `host_id`, `purpose` (`xfer:put`, `xfer:get`, or `xfer:root`), `dir` (`put` or `get`), absolute `root`, relative `path`, `size`, `sha256`, `overwrite`, and a requested `transport`. `size` is a byte count from 0 through `2^63-1`. A larger value is `too_large`. Size 0 is an empty file.
 
-The response carries `grant_id`, `transfer_id` (64-bit demux id, not a secret), expiry, idle, max, `byte_cap`, the path and hash the client asked for, `profile` (`internet` or `dc`), the chosen `transport`, `peer.udp` and `peer.quic`, `aead` (`ChaCha20-Poly1305`), a 32-byte `key`, and a 16-byte `route_token`. Both secrets come from the OS CSPRNG. The client checks host, purpose, root, path, size, and hash before it sends a packet.
+The response carries `grant_id`, `transfer_id` (64-bit demux id, not a secret), `expires_at` (the first-packet deadline, issue plus `expires_in`), idle, max (the hard stop is issue plus `max_seconds`, at most 3600 s), `byte_cap`, the path and hash the client asked for, `profile` (`internet` or `dc`), the chosen `transport`, `peer.udp` and `peer.quic`, `aead` (`ChaCha20-Poly1305`), a 32-byte `key`, and a 16-byte `route_token`. Both secrets come from the OS CSPRNG. The client checks host, purpose, root, path, size, and hash before it sends a packet.
 
 `profile` and `transport` are server choices. The client cannot select `dc` or turn the cipher off. An unknown transport is `mismatch` in this repository's client.
 
-The same key, route token, transfer id, path, size, and hash are delivered to the host agent on its existing channel. The server that issues the grant is not in this repository. `sahxfer grant` can write a mode-0600 bootstrap file so two local processes can run the data plane. A grant that arrived over HTTPS stays in memory.
+The same key, route token, transfer id, path, size, and hash are delivered to the host agent on its existing channel, under a `systemapi-lease-v1` lease the agent verifies. The lease payload is 18 lines (`docs/design.md` §3.4): grant id, deadline, `start` or `renew`, `put` or `get`, root, path, size, sha256, overwrite, transfer id, first-packet deadline, idle, max, byte cap, profile, transport, peer mode, and the hex of `sha256("sahxfer-material-v1\n" || key || route_token)`. `docs/golden-xfer-lease-v2.txt` is the shared vector. The peer mode is `listen` (the host binds and `peer.udp` is the address it reported) or `dial:<host:port>` (the host dials a relay, which is `peer.udp`). `peer.udp` is always where the client sends. A listening host pins the first source whose datagram opens, never an unauthenticated one. The server that issues the grant is not in this repository. `sahxfer grant` can write a mode-0600 bootstrap file so two local processes can run the data plane. A grant that arrived over HTTPS stays in memory.
 
-`xfer:put` is client to host. `xfer:get` swaps the peers: the agent sends, the client receives. One grant is one file. A failed transfer deletes the temp and a new grant starts at offset 0.
+The receiver reports the result to the server: the agent for `put`. The client does not report a put. `xfer:put` is client to host. `xfer:get` swaps the peers: the agent sends, the client receives. One grant is one file. A failed transfer deletes the temp and a new grant starts at offset 0.
+
+### 1.1 Host helper (`recv` agent mode)
+
+The agent verifies the lease, then spawns `sahxfer recv --ctl-fd 3 --event-fd 4` as the identity user with only fds 0 to 4 open. The key travels only on fd 3. Never argv, never env, never disk.
+
+Fd 3, agent to recv, one JSON object per line. The first line is the grant: `v` (1), `grant_id`, `transfer_id`, `purpose`, `dir`, `root`, `path`, `size`, `sha256`, `overwrite`, `profile`, `transport`, `aead`, `key`, `route_token`, `expires_unix` (first-packet deadline), `deadline_unix` (lease deadline), `idle_s`, `max_s`, `byte_cap`, `peer` (`listen:<ip:port>` to bind, port 0 for ephemeral, or `dial:<host:port>`). Unknown fields are refused; the line is capped at 64 KiB and then checked like any grant. The hard stop is the earlier of `deadline_unix - 60 + max_s` and now plus `max_s`. Later lines carry exactly the keys of their op: `{"op":"renew","deadline_unix":<n>}` and `{"op":"cancel","reason":"<code>"}` (`reason` optional). A deadline only moves forward; a renew that does not is refused with `{"ev":"refused","op":"renew","reason":"deadline_not_forward"}` on fd 4 and the old deadline stays. EOF is cancel with reason `stopped`. Any other line, or an extra key, stops the run with reason `protocol`. Fds 3 and 4 must be a pipe or a socket. recv waits at most 10 s for the grant line; a signal ends the wait at once.
+
+Fd 4, recv to agent: `{"ev":"ready","udp":"<bound addr>"}` (`udp` only when listening), `{"ev":"active","bytes":<n>}` on the first authentic packet and then at most once a second, and last `{"ev":"result","grant_id","transfer_id","status","reason","bytes","sha256","committed"}`. `status` is `ok`, `hash_mismatch`, `aborted`, `expired`, or `io_error`. `reason` is an ABORT name (§4.4), `stopped`, or, for a refusal before `ready`, the local code (`exists`, `symlink_refused`, `not_a_file`, `bad_path`, `no_space`). `sha256` is present only when `committed` is true. A commit is `ok` even if `CLOSE_ACK` never came. A grant line that does not arrive or does not decode produces one `{"ev":"result","status":"aborted","reason":"<code>","committed":false}`, without `grant_id` or `transfer_id`, and the code on stderr (`bad_grant` for a line that never came, `cancelled` for a signal).
+
+A cancel, EOF, or lapsed lease sends one `ABORT cancelled` to the peer, deletes the temp, and reports the reason (`expired` for a lapsed lease). After the commit it sends nothing: the target is final, and the result is `ok`. Stdout and stderr are unchanged: three lines on success, one code on failure.
+
+`recv --sweep --ctl-fd 3` reads one line `{"root","path","grant_id"}` and removes only `.sahxfer-<grant_id>.part` in the parent of `path`.
 
 ## 2. Datagram
 
@@ -76,7 +88,7 @@ bytes 4..11 seq
 
 Each direction has its own sequence space. The same sequence from the client and the agent does not share a nonce.
 
-The route token is compared by SHA-256 of both sides, then a constant-time compare. A mismatch is not opened. A failed tag check drops the packet. It is not NACKed and it is not answered. The 32nd route-token mismatch, or the 32nd failed open, aborts the grant with `auth` and wipes the key. The two counters are separate. A mismatch is counted once.
+The route token is compared by SHA-256 of both sides, then a constant-time compare. A mismatch is not opened. A failed tag check drops the packet. It is not NACKed and it is not answered. The 32nd route-token mismatch, or the 32nd failed open, aborts the grant with `auth` and wipes the key. The two counters are separate. A mismatch is counted once. A listening peer counts only after it has pinned a source: before the first authentic datagram, failures from any source are dropped uncounted, so a stranger who can reach the listen port cannot spend the budget and kill the grant before the real peer arrives.
 
 ## 4. Types
 

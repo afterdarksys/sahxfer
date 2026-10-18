@@ -332,26 +332,46 @@ func (p *Peer) Pump(now time.Duration) {
 	}
 }
 
-// Recv authenticates one datagram and applies it.
-func (p *Peer) Recv(now time.Duration, dgram []byte) {
+// Recv authenticates one datagram and applies it. It reports whether the
+// datagram opened under this grant's key and named this transfer, which
+// is what a listener may pin a source on.
+func (p *Peer) Recv(now time.Duration, dgram []byte) bool {
+	return p.recv(now, dgram, true)
+}
+
+// RecvUnpinned is Recv for a datagram whose source is not pinned yet. A
+// route-token or AEAD failure is dropped without spending the auth budget,
+// so a stranger cannot kill the grant before the real peer's first packet.
+func (p *Peer) RecvUnpinned(now time.Duration, dgram []byte) bool {
+	return p.recv(now, dgram, false)
+}
+
+func (p *Peer) recv(now time.Duration, dgram []byte, pinned bool) bool {
 	p.tick(now)
 	if p.state == stAbort {
-		return
+		return false
 	}
-	h, pt, err := p.sess.Open(dgram, p.cfg.PeerDir)
+	var h frame.Header
+	var pt []byte
+	var err error
+	if pinned {
+		h, pt, err = p.sess.Open(dgram, p.cfg.PeerDir)
+	} else {
+		h, pt, err = p.sess.OpenUncounted(dgram, p.cfg.PeerDir)
+	}
 	if errors.Is(err, seal.ErrBudget) {
 		p.abort(now, frame.ReasonAuth)
-		return
+		return false
 	}
 	if err != nil {
-		return
+		return false
 	}
 	if h.TransferID != p.cfg.TransferID {
-		return
+		return false
 	}
 	if !frame.KnownType(h.Type) || !frame.FlagsOK(h.Type, h.Flags) {
 		p.abort(now, frame.ReasonProtocol)
-		return
+		return true
 	}
 	if !p.sawPeer {
 		p.firstRx = now
@@ -379,6 +399,7 @@ func (p *Peer) Recv(now time.Duration, dgram []byte) {
 	default:
 		p.abort(now, frame.ReasonProtocol)
 	}
+	return true
 }
 
 // Take returns datagrams produced since the previous take.
@@ -460,6 +481,22 @@ func (p *Peer) OK() bool {
 		return p.state == stDone
 	}
 	return p.committed && p.gotClose
+}
+
+// Committed reports that the receiver renamed the temp onto the target.
+// It stays true after a later abort; the commit is the fact the audit needs.
+func (p *Peer) Committed() bool { return p.committed }
+
+// Cancel aborts with cancelled and queues one ABORT for the caller to send.
+// A finished, committed, or already aborted peer is left as it is: after a
+// commit the target is final, and the DONE retransmit or the idle timer
+// ends the run, so the sender is not told to discard a file that landed.
+func (p *Peer) Cancel(now time.Duration) {
+	if p.OK() || p.committed {
+		return
+	}
+	p.tick(now)
+	p.abort(now, frame.ReasonCancelled)
 }
 
 // Err is the terminal failure, or nil.

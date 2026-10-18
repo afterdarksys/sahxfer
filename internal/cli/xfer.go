@@ -29,6 +29,10 @@ type side struct {
 	cleanup   func()
 	conn      *net.UDPConn
 	connected bool
+	// progress is udp.Config.Progress. done sees the peer after the run,
+	// for Committed and Delivered. Both may be nil.
+	progress func(uint64)
+	done     func(*engine.Peer)
 }
 
 func cmdPut(ctx context.Context, args []string, stdout io.Writer) error {
@@ -134,8 +138,25 @@ func cmdRecv(ctx context.Context, args []string, stdout io.Writer) error {
 	listen := c.set.String("listen", "", "")
 	to := c.set.String("to", "", "")
 	root := c.set.String("root", "", "")
+	ctlFD := c.set.Int("ctl-fd", -1, "")
+	evFD := c.set.Int("event-fd", -1, "")
+	sweep := c.set.Bool("sweep", false, "")
 	if err := c.parse(args); err != nil {
 		return err
+	}
+	fileMode := c.saw("grant") || c.saw("listen") || c.saw("to") || c.saw("root")
+	if c.saw("sweep") {
+		if !*sweep || fileMode || c.saw("event-fd") || !c.saw("ctl-fd") || *ctlFD < 3 || c.narg() != 0 {
+			return code.New("bad_args")
+		}
+		return recvSweep(ctx, *ctlFD)
+	}
+	if c.saw("ctl-fd") || c.saw("event-fd") {
+		if fileMode || !c.saw("ctl-fd") || !c.saw("event-fd") || c.narg() != 0 ||
+			*ctlFD < 3 || *evFD < 3 || *ctlFD == *evFD {
+			return code.New("bad_args")
+		}
+		return recvAgent(ctx, *ctlFD, *evFD, stdout)
 	}
 	if c.narg() != 0 || !c.saw("grant") || *gpath == "" || c.saw("listen") == c.saw("to") {
 		return code.New("bad_args")
@@ -460,7 +481,7 @@ func transfer(ctx context.Context, s side) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	idle, max, err := s.g.RunLimits(time.Now())
+	idle, max, first, err := s.g.RunLimits(time.Now())
 	if err != nil {
 		return err
 	}
@@ -468,7 +489,7 @@ func transfer(ctx context.Context, s side) error {
 	if err != nil {
 		return err
 	}
-	cfg.Idle, cfg.Max = idle, max
+	cfg.Idle, cfg.Max, cfg.FirstPacket = idle, max, first
 	if cfg.Idle > cfg.Max {
 		cfg.Idle = cfg.Max
 	}
@@ -498,7 +519,11 @@ func transfer(ctx context.Context, s side) error {
 		p.AttachDest(s.dest)
 	}
 	ran = true
-	return udp.Run(ctx, udp.Config{Peer: p, Conn: s.conn, Connected: s.connected, Epoch: 0})
+	err = udp.Run(ctx, udp.Config{Peer: p, Conn: s.conn, Connected: s.connected, Epoch: 0, Progress: s.progress})
+	if s.done != nil {
+		s.done(p)
+	}
+	return err
 }
 
 func wipeCfg(cfg *engine.Config) {
@@ -512,7 +537,7 @@ func ready(g *grant.Grant) error {
 	if err := g.Runnable(); err != nil {
 		return err
 	}
-	_, _, err := g.RunLimits(time.Now())
+	_, _, _, err := g.RunLimits(time.Now())
 	return err
 }
 

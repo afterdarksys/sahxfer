@@ -3,8 +3,8 @@
 // Threats: a bearer, a grant key, or a route token on stdout or stderr; a
 // root compared as a prefix; a put grant used to get; a temp left after
 // cancel. This process does not drop uid. The agent must spawn recv with
-// SysProcAttr.Credential set to the host pty_user. Darwin has no renameat2,
-// so a file created between the exists check and rename can be replaced.
+// SysProcAttr.Credential set to the host pty_user. The host commit is
+// RENAME_NOREPLACE on Linux and renameatx_np(RENAME_EXCL) on Darwin.
 // Stdout is the grant id, the transfer id, and ok. Stderr is a code.
 package cli
 
@@ -231,13 +231,13 @@ func cmdRelay(ctx context.Context, args []string, stderr io.Writer) error {
 		if err := g.Runnable(); err != nil {
 			return err
 		}
-		if _, _, err := g.RunLimits(time.Now()); err != nil {
+		if _, _, _, err := g.RunLimits(time.Now()); err != nil {
 			return err
 		}
 	}
 	r := relay.New()
 	for _, g := range gs {
-		exp := time.Duration(g.Expires.UnixNano())
+		exp := time.Duration(g.HardStop.UnixNano())
 		if err := r.Admit(g.TransferID, g.Token, g.ByteCap, exp); err != nil {
 			return err
 		}

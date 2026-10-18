@@ -1384,3 +1384,96 @@ func TestRangeProbeUndoRefusesNonConforming(t *testing.T) {
 		}
 	}
 }
+
+// Cancel aborts with cancelled, queues exactly one ABORT, and runs cleanup.
+// The peer that receives it aborts cancelled too. A finished peer ignores it.
+func TestCancel(t *testing.T) {
+	file := bytes.Repeat([]byte{3}, 350)
+	pr := newPair(t, file, 100, nil)
+	pr.r.Pump(0)
+	_ = pr.r.Take()
+	pr.r.Cancel(time.Millisecond)
+	out := pr.r.Take()
+	if len(out) != 1 || countType(out, frame.TypeABORT) != 1 {
+		t.Fatalf("out %d abort %d", len(out), countType(out, frame.TypeABORT))
+	}
+	if pr.r.Reason() != frame.ReasonCancelled || pr.cleansR != 1 || pr.r.Committed() {
+		t.Fatalf("reason %d clean %d", pr.r.Reason(), pr.cleansR)
+	}
+	pr.r.Cancel(2 * time.Millisecond)
+	if len(pr.r.Take()) != 0 || pr.cleansR != 1 {
+		t.Fatal("second cancel queued again")
+	}
+	if !pr.s.Recv(time.Millisecond, out[0]) || pr.s.Reason() != frame.ReasonCancelled {
+		t.Fatalf("sender reason %d", pr.s.Reason())
+	}
+
+	pr = newPair(t, file, 100, nil)
+	mustFinish(t, pr, newPipe(), newPipe())
+	if !pr.r.Committed() {
+		t.Fatal("committed")
+	}
+	pr.r.Cancel(time.Hour)
+	pr.s.Cancel(time.Hour)
+	if pr.r.Err() != nil || pr.s.Err() != nil || len(pr.r.Take())+len(pr.s.Take()) != 0 {
+		t.Fatal("cancel after finish")
+	}
+}
+
+// Recv reports an authentic datagram only: a wrong key, a wrong direction,
+// or another transfer id is false and changes nothing.
+func TestRecvReportsAuthentic(t *testing.T) {
+	pr := newPair(t, bytes.Repeat([]byte{4}, 50), 100, nil)
+	ping := frame.Header{Type: frame.TypePING, Seq: 1, TransferID: 7}
+	if pr.r.Recv(0, []byte("not a datagram")) {
+		t.Fatal("garbage")
+	}
+	if pr.r.Recv(0, forge(t, ping, nil, seal.DirAgent)) {
+		t.Fatal("wrong direction")
+	}
+	other := ping
+	other.TransferID = 8
+	if pr.r.Recv(0, forge(t, other, nil, seal.DirClient)) {
+		t.Fatal("other transfer")
+	}
+	if !pr.r.Recv(0, forge(t, ping, nil, seal.DirClient)) {
+		t.Fatal("authentic ping")
+	}
+}
+
+// A cancel that arrives after the receiver committed sends no ABORT: the
+// target is final, and the sender still finishes ok on the DONE.
+func TestCancelAfterCommit(t *testing.T) {
+	file := bytes.Repeat([]byte{5}, 350)
+	pr := newPair(t, file, 100, nil)
+	ab, ba := newPipe(), newPipe()
+	var now time.Duration
+	cancelled := false
+	for step := 0; step < 200000 && !(pr.s.OK() && pr.r.Committed()); step++ {
+		for _, d := range ab.due(now) {
+			pr.r.Recv(now, d)
+		}
+		for _, d := range ba.due(now) {
+			pr.s.Recv(now, d)
+		}
+		pr.s.Pump(now)
+		pr.r.Pump(now)
+		if pr.r.Committed() && !cancelled {
+			pr.r.Cancel(now)
+			cancelled = true
+		}
+		rd := pr.r.Take()
+		if countType(rd, frame.TypeABORT) != 0 {
+			t.Fatal("ABORT after commit")
+		}
+		ab.send(now, pr.s.Take())
+		ba.send(now, rd)
+		if err := pr.failed(); err != nil {
+			t.Fatal(err)
+		}
+		now += 100 * time.Microsecond
+	}
+	if !cancelled || !pr.s.OK() || !pr.r.Committed() || pr.cleansR != 0 || pr.r.Err() != nil {
+		t.Fatalf("cancelled %v sender ok %v committed %v clean %d err %v", cancelled, pr.s.OK(), pr.r.Committed(), pr.cleansR, pr.r.Err())
+	}
+}

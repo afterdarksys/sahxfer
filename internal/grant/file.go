@@ -83,7 +83,7 @@ func Write(path string, g *Grant) error {
 		AEAD:       g.AEAD,
 		Key:        base64.StdEncoding.EncodeToString(g.Key),
 		RouteToken: base64.StdEncoding.EncodeToString(g.Token),
-		ExpiresAt:  g.Expires.UTC().Format(time.RFC3339Nano),
+		ExpiresAt:  g.FirstBy.UTC().Format(time.RFC3339Nano),
 		Idle:       int64(g.Idle / time.Second),
 		Max:        int64(g.Max / time.Second),
 		ByteCap:    Uint64(g.ByteCap),
@@ -233,15 +233,22 @@ func (d fileDoc) grant(now time.Time) (*Grant, error) {
 	if g.ByteCap == 0 {
 		g.ByteCap = g.Size
 	}
+	// expires_at is the first-packet deadline. The file has no issue time,
+	// so the hard stop is max_seconds from the read, and FirstBy never
+	// lies past it.
+	g.HardStop = now.Add(g.Max)
 	if d.ExpiresAt == "" {
-		g.Expires = now.Add(g.Max)
+		g.FirstBy = g.HardStop
 	} else {
 		t, perr := time.Parse(time.RFC3339Nano, d.ExpiresAt)
 		if perr != nil {
 			g.Wipe()
 			return nil, code.New("bad_grant")
 		}
-		g.Expires = t
+		g.FirstBy = t
+		if g.FirstBy.After(g.HardStop) {
+			g.FirstBy = g.HardStop
+		}
 	}
 	if err := g.Check(now); err != nil {
 		g.Wipe()

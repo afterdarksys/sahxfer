@@ -258,3 +258,35 @@ func TestBadKeyLen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Before a source is pinned, token and tag failures are dropped without
+// spending either budget. Counted opens still spend it afterwards.
+func TestOpenUncountedSpendsNothing(t *testing.T) {
+	s := testSession(t)
+	d, err := s.Seal(dataHeader(1), []byte("abc"), DirClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3*AuthBudget; i++ {
+		tok := append([]byte(nil), d...)
+		tok[48] ^= 0xff
+		tag := append([]byte(nil), d...)
+		tag[len(tag)-1] ^= 0xff
+		for _, bad := range [][]byte{tok, tag} {
+			if _, _, err := s.OpenUncounted(bad, DirClient); err != ErrDrop {
+				t.Fatalf("%d: %v", i, err)
+			}
+		}
+	}
+	if s.tokenFails != 0 || s.aeadFails != 0 || s.wiped {
+		t.Fatalf("token %d aead %d", s.tokenFails, s.aeadFails)
+	}
+	if _, _, err := s.OpenUncounted(d, DirClient); err != nil {
+		t.Fatal(err)
+	}
+	bad := append([]byte(nil), d...)
+	bad[len(bad)-1] ^= 0xff
+	if _, _, err := s.Open(bad, DirClient); err != ErrDrop || s.aeadFails != 1 {
+		t.Fatalf("counted open: %v %d", err, s.aeadFails)
+	}
+}

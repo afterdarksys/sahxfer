@@ -88,9 +88,9 @@ func dupfd(fd int) (int, error) {
 	return n, nil
 }
 
-// renameExclusive checks the target, then calls Renameat.
-// Darwin has no renameat2, so a file created after the check and before
-// the rename can be replaced. Linux uses RENAME_NOREPLACE.
+// renameExclusive checks the target, then renames. Without overwrite it is
+// renameatx_np(RENAME_EXCL), so a file created after the check is not
+// replaced (EEXIST is exists), as RENAME_NOREPLACE does on Linux.
 func renameExclusive(dirfd int, tempName, final string, overwrite bool) error {
 	kind, err := statName(dirfd, final)
 	if err != nil {
@@ -101,6 +101,12 @@ func renameExclusive(dirfd int, tempName, final string, overwrite bool) error {
 	}
 	if overwrite && kind == kindOther {
 		return code.New("not_a_file")
+	}
+	if !overwrite {
+		if err := unix.RenameatxNp(dirfd, tempName, dirfd, final, unix.RENAME_EXCL); err != nil {
+			return mapOpenErr(err, false)
+		}
+		return nil
 	}
 	if err := unix.Renameat(dirfd, tempName, dirfd, final); err != nil {
 		return mapOpenErr(err, false)

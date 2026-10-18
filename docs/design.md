@@ -32,8 +32,10 @@ UDP is not faster on every path. On a clean link the ceiling is the disk and Cha
    |   UDP sahxfer, or QUIC datagrams of the same sealed packet          |
    |<===================================================================>|
    |                                                                     |
-   |-- result (hash, size, status) ->|<-------- result -----------------|
+   |                                |<-------- result -----------------|
 ```
+
+The receiver reports the result, because only the receiver knows whether the rename happened. For `put` that is the agent, and the client does not report. For `get` (phase 2) the client is the receiver and reports through `POST /api/v1/xfer/<grant_id>/result`, accepted only from the grant's actor and recorded beside the agent's row, never replacing it.
 
 The grant names the data-plane address. Three placements, one packet format:
 
@@ -107,10 +109,11 @@ Issued only after the intent audit row is durable. If that write fails, the resp
 
 - `transfer_id` is 64 bits from the OS CSPRNG, checked unique among live grants, then stored. It is a demux id. It is not a secret.
 - `key` is 32 bytes from the OS CSPRNG. `route_token` is 16 bytes from the OS CSPRNG.
-- `expires_in` is the time to the first sealed packet (60 s). `idle_seconds` resets on any authentic packet. `max_seconds` is a hard stop from issue (default 3600).
+- `expires_at` is the first-packet deadline: issue plus `expires_in` (60 s). It is not the end of the transfer. `idle_seconds` resets on any authentic packet. `max_seconds` is a hard stop from issue (default 3600). The client computes the hard stop as `expires_at - expires_in + max_seconds`, clamped to 3600 s after issue. A bootstrap file's `expires_at` has the same meaning.
 - `byte_cap` is at least `size` and at most the tenant cap. Recommended tenant default for sahxfer is 256 GiB. `sahsync` stays at its own 16 GiB file cap. Policy may set a lower sahxfer cap. The protocol maximum is `2^63-1`.
 - `profile` is chosen by the server. `internet` is the default. `dc` is allowed only when policy says both peers are on a tenant network.
 - The same `key`, `route_token`, `transfer_id`, path, size, and hash are pushed to the agent on its existing authenticated channel. The push is not a new public port.
+- `peer.udp` is always the address the client sends to. The server picks one of two peer modes and signs it into the lease (§3.4). `listen`: the helper binds an address the agent chooses, reports the bound or advertised address when it is ready, and the server returns that address as `peer.udp`. `dial:<host:port>`: the helper dials a relay and sends the first packet, and `peer.udp` is the relay. Behind NAT with no published port, `listen` cannot work; that is what the relay is for.
 
 The client checks `host_id`, purpose, root, path, size, and hash against what it asked before it sends a packet. A mismatch is a local abort. The key is held in memory for the life of the grant and then wiped. It is not written to the token file. The HTTP client never writes a grant cache. The only disk copy is the explicit bootstrap file in §3.7.
 
@@ -118,15 +121,32 @@ Errors: `bad_purpose`, `bad_root`, `bad_path`, `scope_denied`, `root_denied`, `n
 
 ### 3.4 What the agent does before it accepts packets
 
-The agent refuses the push unless the lease verifies. Lease payload:
+The agent refuses the push unless the lease verifies. The lease is the suite's `systemapi-lease-v1` envelope, signed as `"<action>\n<payload>"` with action `xfer` or `xfer_root`, with the control-plane Ed25519 key the agent already pins. The agent checks the envelope (key, host binding, action, expiry, skew, nonce replay). The helper does not; it receives a grant the agent has already verified. The payload is 18 lines joined by `\n`, no trailing newline. A builder refuses a control byte or a newline in any field.
 
 ```
-<grant_id>\n<deadline_unix>\n<start|renew>\n<put|get>\n<root>\n<path>\n<size>\n<sha256>
+ 1 grant_id        ^xfr_[A-Za-z0-9_-]{8,64}$
+ 2 deadline_unix   lease deadline, issue plus 60
+ 3 start|renew
+ 4 put|get
+ 5 root            absolute
+ 6 path            relative, file protocol shape
+ 7 size            decimal
+ 8 sha256          64 lowercase hex
+ 9 overwrite       0 or 1
+10 transfer_id     16 lowercase hex, not all zero
+11 expires_unix    first-packet deadline
+12 idle_s          1 to max_s
+13 max_s           1 to 3600
+14 byte_cap        decimal, at least size
+15 profile         internet or dc
+16 transport       udp in v1
+17 peer            listen or dial:<host:port>
+18 material        hex of sha256("sahxfer-material-v1\n" || key || route_token), raw 32 and 16 bytes
 ```
 
-Signed with the control-plane Ed25519 key the agent already pins. A write lease does not authorize a get, and the reverse. Renewal is every 30 s. TTL is 60 s. If renewal fails, the helper aborts and deletes the temp file.
+The payload binds every field the agent or the helper acts on, including a hash of the key material, so the server stores the material hash for renewals and not the key. The agent rebuilds the payload from the frame fields it is about to use, so a changed field fails as `payload_mismatch`. A renew is rebuilt from the stored grant with only the phase and the deadline changed, so a renew cannot change a field. A write lease does not authorize a get, and the reverse. Renewal is every 30 s. TTL is 60 s. If renewal fails, the helper aborts at the deadline it was given and deletes the temp file. `docs/golden-xfer-lease-v2.txt` is the shared test vector.
 
-The UDP socket may live in the agent parent, because binding and demux are not file access. The parent checks `transfer_id` and `route_token`, then passes the sealed datagram to the helper. The parent does not have the grant key.
+In v1 the UDP socket stays in the helper. The helper binds (`listen`) or dials (`dial:`) itself. A parent-owned socket that checks `transfer_id` and `route_token` and passes sealed datagrams to the helper is allowed by this design, but the agent already receives the key in the grant push, so moving the socket hides nothing; it is a later optimisation. A listening helper pins the first source address only after a datagram from it opens under AEAD, so a forged first datagram does not capture the transfer.
 
 The helper is a child process with uid, gid, and groups dropped to `pty_user`, the same way the file helper does. `xfer:root` is a root helper and only on a root agent. Go must not drop privileges on one goroutine inside the agent process.
 
@@ -152,9 +172,9 @@ Content is not stored. Path, size, and sha256 identify the file.
 
 The receiver commits locally. It does not wait for a second control-plane RTT to rename.
 
-1. Hole map empty, streamed SHA-256 equals the grant, `fsync` of the temp file, `fsync` of the parent directory, then rename.
+1. Hole map empty, streamed SHA-256 equals the grant, `fsync` of the temp file, `fsync` of the parent directory, then rename (`RENAME_NOREPLACE` on Linux, `renameatx_np(RENAME_EXCL)` on Darwin, unless overwrite).
 2. Send `DONE`.
-3. Report the result to SystemAPI.
+3. The receiver reports the result to SystemAPI. For `put` that is the agent, with `committed` true once the rename happened, even if `CLOSE_ACK` never arrives. The client does not report a put. For `get` (phase 2) the client reports (§2).
 
 `DONE` before `fsync` is forbidden. A crash before rename leaves the target unchanged. The temp file is removed on abort, expiry, and process exit.
 

@@ -668,7 +668,7 @@ func grantJSON(t *testing.T, g *grant.Grant, peer, sum string) []byte {
 	}{
 		GrantID: g.GrantID, HostID: g.HostID,
 		TransferID: fmt.Sprintf("%016x", g.TransferID),
-		ExpiresAt:  g.Expires.UTC().Format(time.RFC3339Nano),
+		ExpiresAt:  g.FirstBy.UTC().Format(time.RFC3339Nano),
 		Idle:       int64(g.Idle / time.Second), Max: int64(g.Max / time.Second),
 		ByteCap: g.ByteCap, Purpose: g.Purpose, Root: g.Root, Path: g.Path,
 		Size: g.Size, SHA256: sum, Overwrite: g.Overwrite,
