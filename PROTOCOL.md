@@ -4,6 +4,11 @@ Version 1. One grant moves one regular file in one direction. SAH authorizes the
 
 `docs/design.md` is the working spec. This file is the wire protocol a peer implements. Congestion in this repository is pace-bbr, a tested subset of the BBRv3 shape, not a byte-identical BBRv3. The portable I/O path is `pread` / `pwrite`. The CLI speaks UDP. `internal/quic` implements the QUIC pipe. The CLI does not call it, and a QUIC grant still returns `agent_unsupported`.
 
+The local `put --pipeline-source` experiment overlaps source reads with packet
+processing using two bounded buffers. It requires no peer negotiation and
+changes no grant, frame, digest, pacing, or completion rules. It is off by default;
+receiver writes and verification remain synchronous.
+
 ## 1. Grant
 
 The client sends one credential in a header. `Authorization: Bearer` carries the sahconnect device-login token, and only when that token is bound to the request origin. `X-API-Key` is the other credential. The two are not sent together. Credentials never appear in a query string or in a UDP field.

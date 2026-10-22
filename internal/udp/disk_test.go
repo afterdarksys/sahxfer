@@ -19,6 +19,12 @@ import (
 // Source creation and independent destination verification are untimed.
 // This is a local warm-cache benchmark, not a WAN or cold-storage claim.
 func BenchmarkDiskTransfer(b *testing.B) {
+	for _, pipeline := range []bool{false, true} {
+		b.Run(fmt.Sprintf("pipeline=%t", pipeline), func(b *testing.B) { benchmarkDiskTransfer(b, pipeline) })
+	}
+}
+
+func benchmarkDiskTransfer(b *testing.B, pipeline bool) {
 	const size = 30_000_000
 	body := make([]byte, size)
 	for i := range body {
@@ -55,7 +61,7 @@ func BenchmarkDiskTransfer(b *testing.B) {
 			var sum [32]byte
 			copy(sum[:], h.Sum(nil))
 			key, token := testMaterial()
-			cfg := engine.Config{Size: size, Key: key, Token: token, TransferID: 7, Sender: true, LocalDir: 0, PeerDir: 1, HaveHash: true, ExpectHash: sum}
+			cfg := engine.Config{SourcePipeline: pipeline, Size: size, Key: key, Token: token, TransferID: 7, Sender: true, LocalDir: 0, PeerDir: 1, HaveHash: true, ExpectHash: sum}
 			s, err := engine.New(cfg)
 			if err != nil {
 				b.Fatal(err)

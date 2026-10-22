@@ -21,6 +21,13 @@ A finished command writes three lines to stdout: the grant id, the transfer id a
 
 `--diag` on `put`, `get`, and `recv` adds `diag ` lines on stderr: the granted socket buffers when the socket opens (`diag rcvbuf=<n> sndbuf=<n>`), one `diag warn` line if the receive buffer is smaller than the arrival rate times `max(RTprop, 5 ms)`, and at most one `diag pace` line per second on the UDP sender with state, bandwidth estimate, flight bytes, window cap, delivered prefix, and smoothed RTT. Without it stderr is only the code.
 
+`put --pipeline-source` enables experimental asynchronous source read-ahead.
+One worker reads the next block while the engine processes the current block,
+using at most 512 KiB of source buffers. It is off by default, works with both
+`--grant` and `--url`, and changes no wire fields. It does not pipeline receiver
+writes or eliminate source hash preparation. See [measurements](docs/performance.md)
+and [the I/O specification](docs/design.md#73-where-this-runs).
+
 Socket buffers. Each end asks for 8 MiB of `SO_RCVBUF` and `SO_SNDBUF`. Linux caps that at `net.core.rmem_max` / `net.core.wmem_max` (often 208 KiB), and the helper runs as the host user, so it cannot force more. On a Linux host, as root:
 
 ```

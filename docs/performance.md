@@ -78,6 +78,48 @@ preparation and durable file commit; it is a scheduling regression check.
 
 ## Remaining work
 
+### Source read-ahead experiment (2026-10-22)
+
+`put --pipeline-source` enables one asynchronous source reader. It hands off
+owned buffers through bounded channels; the engine retains hashing, sealing,
+sequence allocation, and pacing. Two source buffers total at most 512 KiB.
+Repairs reread the source, ZERO scans remain synchronous, and receiver writes
+and commit are unchanged. Initial source validation still precedes the transfer.
+The option is off by default and requires no negotiation or wire changes.
+
+Final measurements on Darwin amd64, Intel i9-9880H, Go 1.27.3, with warm file
+caches and no concurrent test/compile jobs from this session:
+
+| Measurement | Pipeline off | Pipeline on |
+| --- | --- | --- |
+| 4 MiB source classification, three samples | 3,067–3,281 MB/s | 3,071–3,188 MB/s |
+| 30 MB disk/UDP transfer, five samples | 52.07–54.82 MB/s | 53.19–55.05 MB/s |
+| Disk/UDP median | 53.59 MB/s | 53.96 MB/s |
+| Source microbenchmark allocation bytes per iteration | 4,456,461 (representative) | 4,719,160 (representative) |
+
+The median difference is below 1%, with overlapping ranges. This does **not**
+establish an end-to-end performance improvement on this workload. Keep the
+option experimental; test cold or slower storage and larger transfers before
+considering a default change. Allocation bytes include per-frame allocations
+over the whole iteration, not just the bounded live lookahead buffers. Earlier
+samples taken concurrently with tests were excluded from this table.
+
+Reproduce with the existing `BenchmarkFileSource` and `BenchmarkDiskTransfer`:
+both now report `pipeline=false` and `pipeline=true` subbenchmarks. Use
+`-benchtime=1x -count=5` for the disk benchmark. Each disk sample independently
+verifies the destination after durable commit.
+
+Validation: full Darwin and Linux-container suites passed; Darwin engine and
+CLI race suites and `go vet ./...` passed. New tests cover concurrent read-ahead,
+worker join and buffer wiping, skipped blocks, direct repair reads, pending
+frame ownership, internet/DC block boundaries, partial tails, short/error reads,
+abort without commit, loss repair, ZERO runs, and the CLI option. This phase
+does not implement concurrent destination writes or a worker pool for crypto.
+Close waits for any outstanding filesystem read; no cancellation latency bound
+is claimed for a blocked filesystem.
+
+### Next measurements
+
 1. Measure sustained transfers between physical Linux hosts at multiple RTTs,
    with random loss, burst loss, reordering, reverse-path outages, competing
    flows, and slow storage. Existing deterministic path tests remain required.

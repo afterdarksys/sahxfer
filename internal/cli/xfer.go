@@ -41,6 +41,7 @@ type side struct {
 }
 
 type diagKey struct{}
+type sourcePipelineKey struct{}
 
 // withDiag carries the --diag stderr writer to transfer. Without --diag
 // stderr stays a code (docs/design.md section 7.4).
@@ -58,6 +59,7 @@ func diagFrom(ctx context.Context) io.Writer {
 
 func cmdPut(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	c := newCmd()
+	pipeline := c.set.Bool("pipeline-source", false, "experimental bounded source read-ahead")
 	diag := c.set.Bool("diag", false, "")
 	gpath := c.set.String("grant", "", "")
 	base := c.set.String("url", "", "")
@@ -70,6 +72,7 @@ func cmdPut(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	ctx = withDiag(ctx, *diag, stderr)
+	ctx = context.WithValue(ctx, sourcePipelineKey{}, *pipeline)
 	if c.saw("grant") && c.saw("url") {
 		return code.New("bad_args")
 	}
@@ -526,6 +529,7 @@ func transfer(ctx context.Context, s side) error {
 		return err
 	}
 	cfg.Idle, cfg.Max, cfg.FirstPacket = idle, max, first
+	cfg.SourcePipeline, _ = ctx.Value(sourcePipelineKey{}).(bool)
 	if cfg.Idle > cfg.Max {
 		cfg.Idle = cfg.Max
 	}

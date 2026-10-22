@@ -83,6 +83,9 @@ type Config struct {
 	// NoZero makes this peer a v1 peer for ZERO: a receiver does not set
 	// ZERO_OK and refuses ZERO; a sender never sends it (section 4.7).
 	NoZero bool
+	// SourcePipeline overlaps one bounded source read with packet processing.
+	// ReaderAt must support concurrent reads. Off by default.
+	SourcePipeline bool
 }
 
 // Hooks run around commit. Commit is fsync plus rename. Cleanup deletes
@@ -208,12 +211,13 @@ type Peer struct {
 
 	// rxWire is the bytes of authentic datagrams received; minRTT is the
 	// least RTT sample. RecvRate reports them for the socket-buffer check.
-	rxWire    uint64
-	minRTT    time.Duration
-	scanBuf   []byte
-	sourceBuf []byte
-	sourceAt  uint64
-	openBuf   []byte
+	rxWire     uint64
+	minRTT     time.Duration
+	scanBuf    []byte
+	sourceBuf  []byte
+	sourceAt   uint64
+	sourcePipe *sourcePipeline
+	openBuf    []byte
 }
 
 // pendFrame is one classified frame: DATA with its bytes, or a ZERO span.
@@ -580,14 +584,21 @@ func (p *Peer) Err() error { return p.fail }
 // Reason is the ABORT code, or 0.
 func (p *Peer) Reason() uint64 { return p.reason }
 
-// Close wipes the session key and route token. The cipher library may
+// Close joins source read-ahead and wipes owned plaintext, the session key,
+// and route token. Call before closing the source. The cipher library may
 // retain its own key copy until it is garbage-collected.
 func (p *Peer) Close() {
-	if p == nil || p.sess == nil {
+	if p == nil {
 		return
 	}
-	p.sess.Wipe()
-	p.sess = nil
+	if p.sourcePipe != nil {
+		p.sourcePipe.close()
+		p.sourcePipe = nil
+	}
+	if p.sess != nil {
+		p.sess.Wipe()
+		p.sess = nil
+	}
 	clear(p.openBuf[:cap(p.openBuf)])
 	clear(p.sourceBuf[:cap(p.sourceBuf)])
 	clear(p.scanBuf[:cap(p.scanBuf)])
@@ -924,6 +935,9 @@ func (p *Peer) readSource(dst []byte, off uint64, repair bool) error {
 	}
 	end := off + uint64(len(dst))
 	if off < p.sourceAt || end > p.sourceAt+uint64(len(p.sourceBuf)) {
+		if p.cfg.SourcePipeline {
+			return p.readPipelinedSource(dst, off)
+		}
 		n := min(uint64(256<<10), p.cfg.Size-off)
 		if cap(p.sourceBuf) < int(n) {
 			p.sourceBuf = make([]byte, n)

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -42,6 +43,12 @@ func BenchmarkFileReceive(b *testing.B) {
 }
 
 func BenchmarkFileSource(b *testing.B) {
+	for _, pipeline := range []bool{false, true} {
+		b.Run(fmt.Sprintf("pipeline=%t", pipeline), func(b *testing.B) { benchmarkFileSource(b, pipeline) })
+	}
+}
+
+func benchmarkFileSource(b *testing.B, pipeline bool) {
 	const size = 4 << 20
 	f, err := os.CreateTemp(b.TempDir(), "source")
 	if err != nil {
@@ -55,7 +62,7 @@ func BenchmarkFileSource(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p := &Peer{cfg: Config{Size: size, MSS: frame.InternetPlaintext}, src: f}
+		p := &Peer{cfg: Config{Size: size, MSS: frame.InternetPlaintext, SourcePipeline: pipeline}, src: f}
 		for off := uint64(0); off < size; {
 			packet, err := p.classify(frame.Span{Start: off, End: size}, false)
 			if err != nil {
@@ -63,5 +70,6 @@ func BenchmarkFileSource(b *testing.B) {
 			}
 			off = packet.sp.End
 		}
+		p.Close()
 	}
 }

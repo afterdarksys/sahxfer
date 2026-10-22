@@ -434,7 +434,7 @@ func TestSymlinkAndFIFO(t *testing.T) {
 	assertFail(t, "not_a_file", "get", "--grant", gp, "--listen", ln.LocalAddr().String(), "--out", outFIFO)
 }
 
-func copyDirect(t *testing.T, dir string, body []byte) {
+func copyDirect(t *testing.T, dir string, body []byte, flags ...string) {
 	t.Helper()
 	isolate(t)
 	root := phys(t)
@@ -450,7 +450,9 @@ func copyDirect(t *testing.T, dir string, body []byte) {
 		g, path := makeGrant(t, "put", root, "inbox/app.bin", body, nil)
 		rx := goCmd(ctx, "recv", "--grant", path, "--listen", addr, "--root", root)
 		time.Sleep(100 * time.Millisecond)
-		tx := await(t, goCmd(ctx, "put", "--grant", path, "--to", addr, src))
+		args := append([]string{"put"}, flags...)
+		args = append(args, "--grant", path, "--to", addr, src)
+		tx := await(t, goCmd(ctx, args...))
 		assertOK(t, tx, g)
 		assertOK(t, await(t, rx), g)
 		got, err := os.ReadFile(filepath.Join(root, "inbox", "app.bin"))
@@ -477,6 +479,10 @@ func copyDirect(t *testing.T, dir string, body []byte) {
 
 func TestDirectPut(t *testing.T) {
 	copyDirect(t, "put", bytes.Repeat([]byte("abc"), 1700))
+}
+
+func TestPipelinePut(t *testing.T) {
+	copyDirect(t, "put", bytes.Repeat([]byte("pipeline"), 100000), "--pipeline-source")
 }
 
 func TestDirectGet(t *testing.T) {
