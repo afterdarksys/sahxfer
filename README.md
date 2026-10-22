@@ -36,8 +36,16 @@ per-packet temporary allocations; the complete transfer is not allocation-free.
 The [platform roadmap](docs/platform-roadmap.md) records the next-generation
 direction: durable processed-event streams first, then fresh-update analytics
 and bulk AI datasets/checkpoints. The [durable-stream contract](docs/durable-streams.md)
-is a proposal, not a shipped streaming service. Audit exports, retention controls,
+now has a local storage prototype and a proposed network contract, not a shipped
+streaming service. Audit exports, retention controls,
 deployment compliance profiles, and commercial release gates are planned there.
+
+Run the synthetic durable-stream harness with
+`go run ./cmd/streamlab -records 1024 -record-bytes 4096 -batch 64`.
+It creates temporary local outbox/sink stores, exercises lost-ack retries and
+consumer restart/replay, verifies data, prints counts, and removes its temporary
+stores. The prototype is single-node, stores plaintext locally, and has no
+network listener, stream grants, retention eviction, or replication.
 
 Socket buffers. Each end asks for 8 MiB of `SO_RCVBUF` and `SO_SNDBUF`. Linux caps that at `net.core.rmem_max` / `net.core.wmem_max` (often 208 KiB), and the helper runs as the host user, so it cannot force more. On a Linux host, as root:
 

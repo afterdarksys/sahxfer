@@ -15,6 +15,7 @@
 package safeio
 
 import (
+	"io"
 	"os"
 	"strings"
 
@@ -22,10 +23,66 @@ import (
 	"github.com/afterdarksys/sahxfer/internal/pathx"
 )
 
+// LockExclusive takes a nonblocking advisory lock until Root.Close. All writers
+// of the local stream store must participate; it is not an authorization check.
+func (r *Root) LockExclusive() error {
+	if r == nil || r.fd < 0 {
+		return code.New("bad_root")
+	}
+	if r.lock >= 0 {
+		return nil
+	}
+	// Linux roots are O_PATH descriptors. Open the same directory beneath
+	// that descriptor for flock; never resolve its pathname again.
+	fd, err := openDir(r.fd, ".")
+	if err != nil {
+		return err
+	}
+	if err := lockfd(fd); err != nil {
+		closefd(fd)
+		return err
+	}
+	r.lock = fd
+	return nil
+}
+
+// Sync persists directory-entry changes after a rename.
+func (r *Root) Sync() error {
+	if r == nil || r.fd < 0 {
+		return code.New("bad_root")
+	}
+	fd, err := openDir(r.fd, ".")
+	if err != nil {
+		return err
+	}
+	defer closefd(fd)
+	return fsyncfd(fd)
+}
+
+// Empty checks initialization without following paths or enumerating an
+// unbounded directory. Call only on a newly opened, exclusively locked root.
+func (r *Root) Empty() (bool, error) {
+	if r == nil || r.fd < 0 {
+		return false, code.New("bad_root")
+	}
+	fd, err := openDir(r.fd, ".")
+	if err != nil {
+		return false, err
+	}
+	f := os.NewFile(uintptr(fd), "root")
+	defer f.Close()
+	entries, err := f.ReadDir(1)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	return len(entries) == 0, nil
+}
+
 // Root is a directory fd for one grant root.
 type Root struct {
 	fd   int
 	path string
+	lock int
 }
 
 // OpenRoot opens path as a directory without following a symlink.
@@ -37,13 +94,17 @@ func OpenRoot(path string) (*Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Root{fd: fd, path: path}, nil
+	return &Root{fd: fd, path: path, lock: -1}, nil
 }
 
 // Close releases the root fd.
 func (r *Root) Close() error {
 	if r == nil || r.fd < 0 {
 		return nil
+	}
+	if r.lock >= 0 {
+		_ = closefd(r.lock)
+		r.lock = -1
 	}
 	err := closefd(r.fd)
 	r.fd = -1

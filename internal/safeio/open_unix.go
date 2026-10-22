@@ -27,6 +27,16 @@ func fsyncfd(fd int) error {
 	return nil
 }
 
+func lockfd(fd int) error {
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return code.New("busy")
+		}
+		return code.New("io")
+	}
+	return nil
+}
+
 func unlinkAt(dirfd int, name string) error {
 	return unix.Unlinkat(dirfd, name, 0)
 }

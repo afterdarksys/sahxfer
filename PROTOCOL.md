@@ -12,8 +12,10 @@ receiver writes and verification remain synchronous.
 UDP's local returned-buffer cache and reusable nonce scratch do not change the
 wire format or delivery semantics. Packet sequence remains direction-specific
 and never reused under a key. Streaming processed events requires a separate
-grant and protocol contract; `docs/durable-streams.md` is a proposal and does
-not authorize using v1 file grants for live streams.
+grant and protocol contract; the network contract in `docs/durable-streams.md`
+remains proposed and does not authorize v1 file grants for live streams. The local `streamlog`
+prototype and `streamlab` harness exercise storage/replay only; their segment
+format is not a data-plane frame or a replacement for stream authorization.
 
 ## 1. Grant
 

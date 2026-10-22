@@ -19,7 +19,7 @@ the first streaming use case. Preserve the other two tracks for later releases:
 | Track | Delivery contract | Status / order |
 | --- | --- | --- |
 | Existing file transfer | One granted file, verified hash, durable replacement | Implemented baseline, ongoing performance work |
-| Durable processed events | Per-partition order, persisted acknowledgment, replay, explicit gaps | First streaming release; specification below |
+| Durable processed events | Per-partition order, persisted acknowledgment, replay, explicit gaps | Local storage/harness implemented; network integration next |
 | Fresh-update analytics | Explicit supersession and bounded staleness; snapshots recover state | Future release after durable streams |
 | Bulk AI datasets/checkpoints | Versioned manifests, verified resume, atomic dataset publication | Future release after durable streams; single files already work |
 
@@ -54,10 +54,17 @@ comparisons including preparation and durable commit.
 
 ### B. Durable event-stream prototype
 
-Implement the separate contract in `docs/durable-streams.md`: bounded framing,
+Implemented local milestone: immutable append segments and atomic checkpoints,
+exclusive writer lock, bounded parsing/quotas, producer epochs, deduplicated
+retries, bounded replay, distinct persisted/processed cursors, and a synthetic
+producer/outbox/consumer harness. Crash-boundary and corruption tests cover this
+local disk contract. Local audit metadata is available; signed export and the
+control-plane audit outbox are not implemented.
+
+Next implement the network portions of `docs/durable-streams.md`: bounded framing,
 partition sequence and producer fencing, durable log, reconnect/replay, receiver
 credit, and distinct received/persisted/processed states. Start with a local
-fault-injection harness and explicit bootstrap authorization. No public stream
+fault-injection harness (now present) and explicit bootstrap authorization. No public stream
 service until the grant API and agent integration land in their own change.
 
 Gate: crash injection before/after append, fsync, acknowledgment and checkpoint;

@@ -27,6 +27,8 @@ func createExcl(int, string) (int, error) { return -1, code.New("agent_unsupport
 
 func fsyncfd(int) error { return code.New("agent_unsupported") }
 
+func lockfd(int) error { return code.New("agent_unsupported") }
+
 func renameExclusive(int, string, string, bool) error { return code.New("agent_unsupported") }
 
 func unlinkAt(int, string) error { return code.New("agent_unsupported") }
