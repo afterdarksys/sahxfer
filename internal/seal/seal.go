@@ -47,6 +47,7 @@ var (
 )
 
 // Session holds one direction-pair of sequence spaces under one key.
+// A Session has one owner; its methods must not be called concurrently.
 // Seq 0 and seq MaxUint64 are rejected so a counter cannot wrap to 0.
 type Session struct {
 	aead       aeadIface
@@ -55,6 +56,8 @@ type Session struct {
 	aeadFails  int
 	tokenFails int
 	wiped      bool
+	sendNonce  [12]byte
+	openNonce  [12]byte
 }
 
 type aeadIface interface {
@@ -91,6 +94,8 @@ func (s *Session) Wipe() {
 	for i := range s.token {
 		s.token[i] = 0
 	}
+	clear(s.sendNonce[:])
+	clear(s.openNonce[:])
 	s.aead = nil
 	s.wiped = true
 }
@@ -111,6 +116,12 @@ func TokenEqual(a, b []byte) bool {
 // overwritten. Unknown types are sealed so a test can craft one; Open does
 // not accept or reject them.
 func (s *Session) Seal(h frame.Header, pt []byte, dir byte) ([]byte, error) {
+	return s.SealInto(nil, h, pt, dir)
+}
+
+// SealInto reuses dst capacity for one complete datagram. dst and pt must not
+// overlap. The caller owns the output until it explicitly recycles it.
+func (s *Session) SealInto(dst []byte, h frame.Header, pt []byte, dir byte) ([]byte, error) {
 	if s == nil || s.wiped || s.aead == nil {
 		return nil, ErrWiped
 	}
@@ -126,11 +137,17 @@ func (s *Session) Seal(h frame.Header, pt []byte, dir byte) ([]byte, error) {
 	h.Version = frame.Version
 	h.PayloadLen = uint64(len(pt))
 	h.RouteToken = s.token
-	var aad [frame.HeaderSize]byte
-	frame.Put(aad[:], h)
-	buf := make([]byte, frame.HeaderSize, frame.HeaderSize+len(pt)+s.aead.Overhead())
-	copy(buf, aad[:])
-	buf = s.aead.Seal(buf, nonce(dir, h.Seq), pt, aad[:])
+	need := frame.HeaderSize + len(pt) + s.aead.Overhead()
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	}
+	buf := dst[:frame.HeaderSize]
+	frame.Put(buf, h)
+	putNonce(&s.sendNonce, dir, h.Seq)
+	// Keep dst disjoint from additionalData as required by cipher.AEAD.
+	// Capacity was reserved above, so ciphertext stays behind this header.
+	sealed := s.aead.Seal(buf[frame.HeaderSize:], s.sendNonce[:], pt, buf[:frame.HeaderSize])
+	buf = buf[:frame.HeaderSize+len(sealed)]
 	return buf, nil
 }
 
@@ -179,7 +196,8 @@ func (s *Session) open(dst, dgram []byte, peerDir byte, count bool) (frame.Heade
 	if !TokenEqual(h.RouteToken[:], s.token[:]) {
 		return frame.Header{}, nil, s.failIf(count, true)
 	}
-	pt, err := s.aead.Open(dst, nonce(peerDir, h.Seq), dgram[frame.HeaderSize:], dgram[:frame.HeaderSize])
+	putNonce(&s.openNonce, peerDir, h.Seq)
+	pt, err := s.aead.Open(dst, s.openNonce[:], dgram[frame.HeaderSize:], dgram[:frame.HeaderSize])
 	if err != nil {
 		return frame.Header{}, nil, s.failIf(count, false)
 	}
@@ -213,8 +231,8 @@ func (s *Session) fail(token bool) error {
 	return ErrDrop
 }
 
-func nonce(dir byte, seq uint64) []byte {
-	var n [12]byte
+func putNonce(n *[12]byte, dir byte, seq uint64) {
+	clear(n[:])
 	n[0] = dir
 	n[4] = byte(seq)
 	n[5] = byte(seq >> 8)
@@ -224,5 +242,4 @@ func nonce(dir byte, seq uint64) []byte {
 	n[9] = byte(seq >> 40)
 	n[10] = byte(seq >> 48)
 	n[11] = byte(seq >> 56)
-	return n[:]
 }

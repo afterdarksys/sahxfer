@@ -42,7 +42,7 @@ type sockIO struct {
 	// for the address it was built for.
 	wname  unix.RawSockaddrAny
 	wlen   uint32
-	wfor   string
+	wfor   *net.UDPAddr
 	wready bool
 }
 
@@ -141,7 +141,7 @@ func (s *sockIO) write(pkts [][]byte, to *net.UDPAddr) error {
 		if to == nil {
 			return errors.New("udp: no destination")
 		}
-		if !s.wready || s.wfor != to.String() {
+		if !s.wready || !sameAddr(s.wfor, to) {
 			if !s.encodeName(to) {
 				return errors.New("udp: bad destination")
 			}
@@ -238,7 +238,7 @@ func (s *sockIO) encodeName(to *net.UDPAddr) bool {
 		}
 		s.wlen = unix.SizeofSockaddrInet6
 	}
-	s.wfor = to.String()
+	s.wfor = copyAddr(to)
 	s.wready = true
 	return true
 }

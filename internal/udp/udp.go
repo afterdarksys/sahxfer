@@ -68,9 +68,15 @@ func Run(ctx context.Context, cfg Config) error {
 		return code.New("internal")
 	}
 	defer cfg.Peer.Close()
+	cfg.Peer.EnablePacketReuse()
 	sio := newSockIO(cfg.Conn, cfg.Connected)
 	var remote *net.UDPAddr
 	var queued [][]byte
+	defer func() { cfg.Peer.ReleasePackets(queued) }()
+	write := func(ctx context.Context, to *net.UDPAddr, pkts [][]byte) error {
+		defer cfg.Peer.ReleasePackets(pkts)
+		return flush(ctx, sio, to, pkts)
+	}
 	// The sender becomes OK when DONE checks out, then rate-limits the
 	// CLOSE_ACK FIN until an RTT has passed. Stay up until that FIN is written.
 	var finSent, closeSent bool
@@ -84,7 +90,9 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Peer.Cancel(clock(cfg.Epoch))
 		out := cfg.Peer.Take()
 		if cfg.Connected || remote != nil {
-			_ = flush(context.Background(), sio, remote, out)
+			_ = write(context.Background(), remote, out)
+		} else {
+			cfg.Peer.ReleasePackets(out)
 		}
 		return ctx.Err()
 	}
@@ -137,7 +145,7 @@ func Run(ctx context.Context, cfg Config) error {
 				continue
 			}
 			if !cfg.Connected {
-				if pk.addr == nil || (remote != nil && pk.addr.String() != remote.String()) {
+				if pk.addr == nil || (remote != nil && !sameAddr(pk.addr, remote)) {
 					continue
 				}
 			}
@@ -153,13 +161,14 @@ func Run(ctx context.Context, cfg Config) error {
 			if ok && !cfg.Connected && remote == nil {
 				// Pin only after the datagram opened under the grant key.
 				remote = copyAddr(pk.addr)
-				if err := flush(ctx, sio, remote, queued); err != nil {
+				pending := queued
+				queued = nil
+				if err := write(ctx, remote, pending); err != nil {
 					if ctx.Err() != nil {
 						return cancel()
 					}
 					return err
 				}
-				queued = nil
 			}
 			if ok && cfg.Progress != nil {
 				d := cfg.Peer.Delivered()
@@ -191,7 +200,7 @@ func Run(ctx context.Context, cfg Config) error {
 		note(out)
 		if !cfg.Connected && remote == nil {
 			queued = append(queued, out...)
-		} else if err := flush(ctx, sio, remote, out); err != nil {
+		} else if err := write(ctx, remote, out); err != nil {
 			if ctx.Err() != nil {
 				return cancel()
 			}
@@ -239,6 +248,12 @@ func clock(epoch time.Duration) time.Duration {
 		return now
 	}
 	return now - epoch
+}
+
+// sameAddr includes the IPv6 scope: link-local addresses on different
+// interfaces are different peers. IP.Equal normalizes IPv4-mapped addresses.
+func sameAddr(a, b *net.UDPAddr) bool {
+	return a != nil && b != nil && a.Port == b.Port && a.Zone == b.Zone && a.IP.Equal(b.IP)
 }
 
 func copyAddr(a *net.UDPAddr) *net.UDPAddr {

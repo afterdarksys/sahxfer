@@ -468,6 +468,25 @@ The portable sender reads new DATA through a bounded 256 KiB lookahead buffer, t
 
 The engine may reuse a private plaintext buffer for authenticated opens. A receive call consumes that plaintext synchronously; it never retains it in the hole map or an outgoing datagram. Public allocating seal/open operations retain their ownership contract. Failed opens never expose plaintext to the file writer.
 
+Allocation discipline: a seal session has one owner and is not safe for
+concurrent calls. It may reuse separate send/open nonce scratch, encoding the
+same direction and sequence bytes on every call. `SealInto` accepts caller-owned
+output storage disjoint from plaintext and returns a complete sealed datagram;
+the allocating `Seal` retains its independent-output contract. UDP may opt into
+an engine-owned cache of at most 64 returned datagram buffers (at most 512 KiB).
+Only after synchronous socket writes finish or fail may the runner release a
+batch. Partial sends retain ownership until the write loop returns. Queued
+pre-pin packets remain owned until sent or discarded. Returned buffers are
+wiped, including the route token in the header, and the cache is wiped on Close.
+This bounds cached buffers, not all outstanding packets, and does not claim a
+zero-allocation transfer. QUIC and existing Take callers retain ordinary owned
+datagrams unless they explicitly adopt the release contract.
+
+UDP peer identity comparisons use binary IP, port, and IPv6 zone; IPv4-mapped
+representations compare as the same IPv4 address. Pinning still happens only
+after an authenticated open. Caching a send destination never retains a mutable
+caller-owned address.
+
 The fast path is Linux io_uring on the helper. That backend is not in this repo: nothing here pretends to submit `READ_FIXED` or `SEND_ZC`. macOS and the portable build use `pread` / `pwrite` and `sendmsg` / `recvmsg` with the same frames. Tests for loss, reorder, and AEAD run without a NIC, in process, on either OS. Path open on Linux is `openat2` as in §3.4. The Darwin build walks each component with `O_NOFOLLOW`. That walk is not `openat2` and must not be described as if it were.
 
 `O_DIRECT`, `sendfile`, and `splice` are not in v1. They skip the place the cipher has to run, or they fight the page cache for small datagrams.

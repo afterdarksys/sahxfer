@@ -211,13 +211,15 @@ type Peer struct {
 
 	// rxWire is the bytes of authentic datagrams received; minRTT is the
 	// least RTT sample. RecvRate reports them for the socket-buffer check.
-	rxWire     uint64
-	minRTT     time.Duration
-	scanBuf    []byte
-	sourceBuf  []byte
-	sourceAt   uint64
-	sourcePipe *sourcePipeline
-	openBuf    []byte
+	rxWire       uint64
+	minRTT       time.Duration
+	scanBuf      []byte
+	sourceBuf    []byte
+	sourceAt     uint64
+	sourcePipe   *sourcePipeline
+	openBuf      []byte
+	reusePackets bool
+	packetCache  [][]byte
 }
 
 // pendFrame is one classified frame: DATA with its bytes, or a ZERO span.
@@ -604,6 +606,16 @@ func (p *Peer) Close() {
 	clear(p.scanBuf[:cap(p.scanBuf)])
 	clear(p.hashBuf[:cap(p.hashBuf)])
 	p.openBuf, p.sourceBuf, p.scanBuf, p.hashBuf = nil, nil, nil, nil
+	for _, b := range p.packetCache {
+		clear(b[:cap(b)])
+	}
+	p.packetCache = nil
+	if p.reusePackets {
+		for _, b := range p.out {
+			clear(b[:cap(b)])
+		}
+		p.out = nil
+	}
 }
 
 // RecvRate is the receiver's arrival rate in wire bytes per second since
@@ -701,8 +713,10 @@ func (p *Peer) send(now time.Duration, h frame.Header, pt []byte) bool {
 	h.Seq = p.seq
 	h.TransferID = p.cfg.TransferID
 	h.SendTimeNS = uint64(now)
-	d, err := p.sess.Seal(h, pt, p.cfg.LocalDir)
+	buf := p.packetBuffer(frame.Overhead + len(pt))
+	d, err := p.sess.SealInto(buf, h, pt, p.cfg.LocalDir)
 	if err != nil {
+		clear(buf[:cap(buf)])
 		return false
 	}
 	p.out = append(p.out, d)

@@ -76,6 +76,58 @@ near 2 MB/s and flight bytes below the window cap. After the 2 ms correction,
 three runs completed in 0.271–0.384 s, or 78–111 MB/s. That test excludes source
 preparation and durable file commit; it is a scheduling regression check.
 
+## Allocation overhaul (2026-10-22)
+
+UDP now opts into a per-peer cache of at most 64 returned datagram buffers.
+New buffers use 1,232-byte or 8,192-byte size classes; retained buffer capacity
+is at most 512 KiB, excluding outstanding packets and other engine storage.
+Only after a synchronous send finishes or fails does a batch return to the
+cache. Queued pre-pin packets remain owned until sent or discarded. Returned
+buffers are wiped, including the header route token. Existing allocating Take
+callers and QUIC retain their previous ownership contract.
+
+`SealInto` writes into caller-owned storage without overlapping AEAD output
+with additional data. Sessions reuse separate send/open nonce scratch under
+single-owner execution; nonce bytes remain direction plus sequence. UDP compares
+binary IP/port/zone values rather than formatting peer addresses per packet.
+
+The focused seal/open test measures zero allocations after setup with supplied
+buffers. This is not a claim of a zero-allocation transfer: outgoing plaintext,
+socket address decoding, and other work still allocate.
+
+An isolated archive of baseline `9db1211` and the final implementation ran five
+30 MB disk/UDP samples each on Darwin amd64, Intel i9-9880H, Go 1.27.3. Source
+pipeline was off. Both include source preparation and durable commit, use warm
+caches, and independently verify destination contents. No test or compile jobs
+from this session ran concurrently with the timed samples.
+
+| Measurement | Baseline median | Final median |
+| --- | --- | --- |
+| Allocations per transfer | 396,150 | 125,908 |
+| Bytes allocated per transfer | 72,762,696 | 36,200,040 |
+| Goodput | 56.21 MB/s | 57.78 MB/s |
+
+Allocation count fell about 68%, and allocation volume about 50%. Allocated
+bytes are cumulative allocations across both peers, not peak RSS. The local
+median goodput difference is about 3%; five short sequential samples do not
+establish a general throughput advantage. Earlier intermediate versions/runs
+varied from 49.49 to 59.68 MB/s. Allocation reduction is the primary evidence.
+
+Baseline goodput samples: 53.24, 57.30, 56.97, 54.14, 56.21 MB/s.
+Final goodput samples: 57.78, 56.32, 57.93, 57.36, 57.86 MB/s.
+Final allocation counts: 120021, 133647, 125908, 121614, 126906.
+Reproduce with `go test ./internal/udp -run '^$' -bench
+'BenchmarkDiskTransfer/pipeline=false' -benchtime=1x -count=5`.
+
+Validation: full Darwin and Linux suites passed; full Darwin race suite passed
+before the final size-class/AEAD-slice refinements, followed by targeted race
+checks and full Darwin tests, and Linux regression checks for those refinements.
+`go vet ./...` passed. New tests cover independent reference nonce/wire encoding,
+tampered tags in reused storage, zero-allocation seal/open scratch, outstanding
+batch ownership, cache bounds/wiping, size-class transitions, IPv4-mapped peer
+identity, port/host changes, and distinct IPv6 zones. Existing fail-closed grant,
+path, replay, hash, and peer-pinning suites remain in force.
+
 ## Remaining work
 
 ### Source read-ahead experiment (2026-10-22)
