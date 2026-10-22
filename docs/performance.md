@@ -202,3 +202,25 @@ ownership, scratch clearing, and a bitmap reference check of hole tracking.
 
 These checks do not establish Internet fairness, production host isolation,
 or performance at 10/25/100 Gbit/s. Those remain deployment and evaluation work.
+
+## Measurement tranches (2026-10-22)
+
+The disk benchmark now reports preparation, AttachSource validation, setup,
+transfer/verification, durable commit, and close separately. A new opt-in
+`BenchmarkSustainedTransfer` covers both payload profiles and source-pipeline
+settings with streamed random fixtures and bounded-memory verification.
+`scripts/profile-transfer.sh` collects unprofiled timing separately from CPU,
+allocation, and execution-trace artifacts. See [the lab guide](performance-lab.md)
+for precise timing boundaries, reproduction, and the pending physical-host plan.
+No source hash pass or production transport behavior was removed.
+
+Three 256 MiB warm-cache Darwin samples per case measured median end-to-end
+65.56 MB/s (internet, pipeline off), 65.49 MB/s (internet, on), 95.71 MB/s
+(DC, off), and 94.54 MB/s (DC, on). Single 2 GiB runs with pipeline off measured
+63.59 and 101.57 MB/s respectively; their transfer-only intervals measured
+91.59 and 199.0 MB/s. Two initial hash passes consumed about 10.3 s per 2 GiB
+run. These are observations on loopback, not physical-host or competitor results.
+The new random fixture differs from the older benchmark's deterministic body.
+Raw timing and profile reports are in `docs/benchmarks/2026-10-22-transfer/`;
+[the research brief](../FILE_XFER_RESEARCH.md) interprets the findings and defines
+FTP/SFTP/SCP comparisons and the proposed agent-facing product contract.

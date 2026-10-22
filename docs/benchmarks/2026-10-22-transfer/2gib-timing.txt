@@ -1,0 +1,14 @@
+goos: darwin
+goarch: amd64
+pkg: github.com/afterdarksys/sahxfer/internal/udp
+cpu: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz
+BenchmarkSustainedTransfer
+BenchmarkSustainedTransfer/profile=internet/pipeline=false
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 2147483648 bytes profile=internet including preparation and commit: 33.772922951s (63.6 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=false-16         	       1	33772988984 ns/op	  63.59 MB/s	5049384977 attach-ns/op	   1226271 close-ns/op	  29456981 commit-ns/op	5245947049 prepare-ns/op	   1041560 setup-ns/op	        91.59 transfer-MB/s	23445866113 transfer-ns/op	2391675512 B/op	 7721408 allocs/op
+BenchmarkSustainedTransfer/profile=dc/pipeline=false
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 2147483648 bytes profile=dc including preparation and commit: 21.142783917s (101.6 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=false-16               	       1	21142884475 ns/op	 101.57 MB/s	5196431374 attach-ns/op	   1312581 close-ns/op	  26078110 commit-ns/op	5127113189 prepare-ns/op	    327346 setup-ns/op	       199.0 transfer-MB/s	10791521317 transfer-ns/op	2201541904 B/op	 1137481 allocs/op
+PASS

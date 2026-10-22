@@ -33,6 +33,10 @@ datagrams (512 KiB). Buffers return only after socket writes finish or fail and
 are wiped before reuse. Nonce scratch and binary peer-address comparison avoid
 per-packet temporary allocations; the complete transfer is not allocation-free.
 
+The [file-transfer research brief](FILE_XFER_RESEARCH.md) records local speed
+measurements, the pending FTP/SFTP/SCP comparison, and the proposed agent-facing
+transfer and processing contract.
+
 The [platform roadmap](docs/platform-roadmap.md) records the next-generation
 direction: durable processed-event streams first, then fresh-update analytics
 and bulk AI datasets/checkpoints. The [durable-stream contract](docs/durable-streams.md)

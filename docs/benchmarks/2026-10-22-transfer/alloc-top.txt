@@ -1,0 +1,26 @@
+File: udp.test
+Type: alloc_space
+Time: 2026-10-22 04:56:56 EDT
+Showing nodes accounting for 1086.15MB, 98.35% of 1104.37MB total
+Dropped 48 nodes (cum <= 5.52MB)
+      flat  flat%   sum%        cum   cum%
+ 1026.14MB 92.92% 92.92%  1028.04MB 93.09%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).classify
+   20.50MB  1.86% 94.77%    27.50MB  2.49%  github.com/afterdarksys/sahxfer/internal/udp.decodeName
+   17.02MB  1.54% 96.31%    20.53MB  1.86%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).send
+    9.50MB  0.86% 97.17%    38.50MB  3.49%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).read
+       7MB  0.63% 97.81%        7MB  0.63%  net.IPv4 (inline)
+       6MB  0.54% 98.35%        6MB  0.54%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).writeBatch
+         0     0% 98.35%  1050.07MB 95.08%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).Pump
+         0     0% 98.35%  1048.57MB 94.95%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).sendData
+         0     0% 98.35%        6MB  0.54%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).write
+         0     0% 98.35%  1066.61MB 96.58%  github.com/afterdarksys/sahxfer/internal/udp.BenchmarkSustainedTransfer.func1
+         0     0% 98.35%  1097.60MB 99.39%  github.com/afterdarksys/sahxfer/internal/udp.Run
+         0     0% 98.35%        6MB  0.54%  github.com/afterdarksys/sahxfer/internal/udp.Run.func2
+         0     0% 98.35%  1066.61MB 96.58%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer
+         0     0% 98.35%  1066.61MB 96.58%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1
+         0     0% 98.35%  1066.09MB 96.53%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1.3
+         0     0% 98.35%    31.51MB  2.85%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1.3.1
+         0     0% 98.35%        6MB  0.54%  github.com/afterdarksys/sahxfer/internal/udp.flush
+         0     0% 98.35%  1066.09MB 96.53%  runtime/pprof.Do
+         0     0% 98.35%  1067.11MB 96.63%  testing.(*B).run1.func1
+         0     0% 98.35%  1067.11MB 96.63%  testing.(*B).runN

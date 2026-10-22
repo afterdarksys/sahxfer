@@ -1,0 +1,46 @@
+goos: darwin
+goarch: amd64
+pkg: github.com/afterdarksys/sahxfer/internal/udp
+cpu: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz
+BenchmarkSustainedTransfer
+BenchmarkSustainedTransfer/profile=internet/pipeline=false
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.094446448s (65.6 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=false-16         	       1	4094578874 ns/op	  65.56 MB/s	 635071821 attach-ns/op	   1432502 close-ns/op	  31748567 commit-ns/op	 632494415 prepare-ns/op	    417230 setup-ns/op	        96.10 transfer-MB/s	2793281913 transfer-ns/op	302082712 B/op	  963889 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.237909829s (63.3 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=false-16         	       1	4238132659 ns/op	  63.34 MB/s	 652374717 attach-ns/op	   4743473 close-ns/op	  26226478 commit-ns/op	 699261023 prepare-ns/op	    313215 setup-ns/op	        94.02 transfer-MB/s	2854990923 transfer-ns/op	301966408 B/op	  994002 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.094423026s (65.6 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=false-16         	       1	4094487923 ns/op	  65.56 MB/s	 669545370 attach-ns/op	  10412399 close-ns/op	  28208196 commit-ns/op	 627205780 prepare-ns/op	    305780 setup-ns/op	        97.30 transfer-MB/s	2758745501 transfer-ns/op	300118464 B/op	  954475 allocs/op
+BenchmarkSustainedTransfer/profile=internet/pipeline=true
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.231587083s (63.4 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=true-16          	       1	4231726452 ns/op	  63.43 MB/s	 635705256 attach-ns/op	   3634123 close-ns/op	  28159932 commit-ns/op	 686544139 prepare-ns/op	    299580 setup-ns/op	        93.30 transfer-MB/s	2877244053 transfer-ns/op	301155712 B/op	  949137 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.098842012s (65.5 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=true-16          	       1	4098952398 ns/op	  65.49 MB/s	 647196087 attach-ns/op	  10338490 close-ns/op	  24475060 commit-ns/op	 640997587 prepare-ns/op	    303944 setup-ns/op	        96.71 transfer-MB/s	2775530844 transfer-ns/op	300851896 B/op	  937270 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=internet including preparation and commit: 4.050953649s (66.3 MB/s)
+BenchmarkSustainedTransfer/profile=internet/pipeline=true-16          	       1	4051079137 ns/op	  66.26 MB/s	 631666624 attach-ns/op	  12746051 close-ns/op	  29225158 commit-ns/op	 667929033 prepare-ns/op	    343570 setup-ns/op	        99.09 transfer-MB/s	2709043213 transfer-ns/op	300581264 B/op	  960303 allocs/op
+BenchmarkSustainedTransfer/profile=dc/pipeline=false
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.768384707s (97.0 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=false-16               	       1	2768454566 ns/op	  96.96 MB/s	 636555220 attach-ns/op	   1352350 close-ns/op	  29753675 commit-ns/op	 662061026 prepare-ns/op	    310272 setup-ns/op	       186.6 transfer-MB/s	1438352164 transfer-ns/op	276945432 B/op	  166421 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.815371314s (95.3 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=false-16               	       1	2815435560 ns/op	  95.34 MB/s	 658163976 attach-ns/op	   8999524 close-ns/op	  29925889 commit-ns/op	 681333018 prepare-ns/op	    313171 setup-ns/op	       186.9 transfer-MB/s	1436635736 transfer-ns/op	276690944 B/op	  155279 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.804510203s (95.7 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=false-16               	       1	2804581184 ns/op	  95.71 MB/s	 652692484 attach-ns/op	  10499235 close-ns/op	  32814837 commit-ns/op	 671703895 prepare-ns/op	    314671 setup-ns/op	       186.9 transfer-MB/s	1436485081 transfer-ns/op	277324920 B/op	  164709 allocs/op
+BenchmarkSustainedTransfer/profile=dc/pipeline=true
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.837089671s (94.6 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=true-16                	       1	2837162791 ns/op	  94.61 MB/s	 685029586 attach-ns/op	   8781644 close-ns/op	  32214408 commit-ns/op	 648236015 prepare-ns/op	    322120 setup-ns/op	       183.5 transfer-MB/s	1462505898 transfer-ns/op	277566368 B/op	  171472 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.933142799s (91.5 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=true-16                	       1	2933232118 ns/op	  91.52 MB/s	 737012992 attach-ns/op	   2256963 close-ns/op	  31757841 commit-ns/op	 684961740 prepare-ns/op	    329881 setup-ns/op	       181.8 transfer-MB/s	1476823382 transfer-ns/op	277662616 B/op	  169444 allocs/op
+    disk_test.go:173: socket buffers: receiver rcv=8388608 snd=8388608 sender rcv=8388608 snd=8388608
+    disk_test.go:174: 268435456 bytes profile=dc including preparation and commit: 2.839122068s (94.5 MB/s)
+BenchmarkSustainedTransfer/profile=dc/pipeline=true-16                	       1	2839247790 ns/op	  94.54 MB/s	 654762841 attach-ns/op	   3885704 close-ns/op	  39097527 commit-ns/op	 697426521 prepare-ns/op	    298420 setup-ns/op	       185.9 transfer-MB/s	1443651055 transfer-ns/op	277443560 B/op	  176403 allocs/op
+PASS

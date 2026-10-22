@@ -1,0 +1,74 @@
+File: udp.test
+Type: cpu
+Time: 2026-10-22 04:56:38 EDT
+Duration: 18.38s, Total samples = 24.49s (133.24%)
+Active filters:
+   tagfocus=phase=network-and-commit
+Showing nodes accounting for 13.55s, 55.33% of 24.49s total
+Dropped 52 nodes (cum <= 0.12s)
+      flat  flat%   sum%        cum   cum%
+     7.53s 30.75% 30.75%      7.53s 30.75%  syscall.rawsyscalln
+     5.30s 21.64% 52.39%      5.30s 21.64%  syscall.Syscall6
+     0.25s  1.02% 53.41%      0.25s  1.02%  runtime.madvise
+     0.24s  0.98% 54.39%      0.24s  0.98%  crypto/internal/fips140/sha256.blockAVX2
+     0.16s  0.65% 55.04%      0.16s  0.65%  runtime.pthread_cond_signal
+     0.07s  0.29% 55.33%      0.07s  0.29%  runtime.kevent
+         0     0% 55.33%      0.15s  0.61%  _.goready.func1
+         0     0% 55.33%      0.24s  0.98%  crypto/internal/fips140/sha256.(*Digest).Write
+         0     0% 55.33%      0.24s  0.98%  crypto/internal/fips140/sha256.block
+         0     0% 55.33%      0.66s  2.69%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).Pump
+         0     0% 55.33%         7s 28.58%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).Recv (inline)
+         0     0% 55.33%      6.99s 28.54%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).accept
+         0     0% 55.33%      0.39s  1.59%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).classify
+         0     0% 55.33%      6.99s 28.54%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).onData
+         0     0% 55.33%      6.99s 28.54%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).onData.func1
+         0     0% 55.33%      0.39s  1.59%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).readSource
+         0     0% 55.33%         7s 28.58%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).recv
+         0     0% 55.33%      0.65s  2.65%  github.com/afterdarksys/sahxfer/internal/engine.(*Peer).sendData
+         0     0% 55.33%      0.16s  0.65%  github.com/afterdarksys/sahxfer/internal/engine.newSourcePipeline.func1
+         0     0% 55.33%      0.55s  2.25%  github.com/afterdarksys/sahxfer/internal/engine.readFullAt
+         0     0% 55.33%      6.99s 28.54%  github.com/afterdarksys/sahxfer/internal/hole.(*Map).VisitMissing (inline)
+         0     0% 55.33%      0.80s  3.27%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).read
+         0     0% 55.33%      0.76s  3.10%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).read.func1
+         0     0% 55.33%      4.55s 18.58%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).write
+         0     0% 55.33%      4.55s 18.58%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).writeBatch
+         0     0% 55.33%      4.54s 18.54%  github.com/afterdarksys/sahxfer/internal/udp.(*sockIO).writeBatch.func1
+         0     0% 55.33%      5.38s 21.97%  github.com/afterdarksys/sahxfer/internal/udp.BenchmarkSustainedTransfer.func1
+         0     0% 55.33%     13.03s 53.21%  github.com/afterdarksys/sahxfer/internal/udp.Run
+         0     0% 55.33%      4.55s 18.58%  github.com/afterdarksys/sahxfer/internal/udp.Run.func2
+         0     0% 55.33%      5.38s 21.97%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer
+         0     0% 55.33%      5.38s 21.97%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1
+         0     0% 55.33%      5.38s 21.97%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1.3
+         0     0% 55.33%      7.65s 31.24%  github.com/afterdarksys/sahxfer/internal/udp.benchmarkDiskTransfer.func1.3.1
+         0     0% 55.33%      4.55s 18.58%  github.com/afterdarksys/sahxfer/internal/udp.flush
+         0     0% 55.33%      0.55s  2.25%  internal/poll.(*FD).Pread
+         0     0% 55.33%      0.55s  2.25%  internal/poll.(*FD).Pread.func1 (inline)
+         0     0% 55.33%      6.97s 28.46%  internal/poll.(*FD).Pwrite
+         0     0% 55.33%      0.76s  3.10%  internal/poll.(*FD).RawRead
+         0     0% 55.33%      4.54s 18.54%  internal/poll.(*FD).RawWrite
+         0     0% 55.33%      0.55s  2.25%  internal/poll.ignoringEINTR2[go.shape.int] (inline)
+         0     0% 55.33%      0.76s  3.10%  net.(*rawConn).Read
+         0     0% 55.33%      4.54s 18.54%  net.(*rawConn).Write
+         0     0% 55.33%      0.55s  2.25%  os.(*File).ReadAt
+         0     0% 55.33%      6.97s 28.46%  os.(*File).WriteAt
+         0     0% 55.33%      0.55s  2.25%  os.(*File).pread (inline)
+         0     0% 55.33%      6.97s 28.46%  os.(*File).pwrite (inline)
+         0     0% 55.33%      0.25s  1.02%  runtime.(*mheap).alloc.func1
+         0     0% 55.33%      0.25s  1.02%  runtime.(*mheap).allocSpan
+         0     0% 55.33%      0.16s  0.65%  runtime.notewakeup
+         0     0% 55.33%      0.15s  0.61%  runtime.ready
+         0     0% 55.33%      0.16s  0.65%  runtime.semawakeup
+         0     0% 55.33%      0.15s  0.61%  runtime.startm
+         0     0% 55.33%      0.25s  1.02%  runtime.sysUsed (inline)
+         0     0% 55.33%      0.25s  1.02%  runtime.sysUsedOS (inline)
+         0     0% 55.33%      0.48s  1.96%  runtime.systemstack
+         0     0% 55.33%      0.15s  0.61%  runtime.wakep
+         0     0% 55.33%      5.38s 21.97%  runtime/pprof.Do
+         0     0% 55.33%      0.55s  2.25%  syscall.Pread (inline)
+         0     0% 55.33%      6.97s 28.46%  syscall.Pwrite (inline)
+         0     0% 55.33%      0.55s  2.25%  syscall.pread
+         0     0% 55.33%      6.97s 28.46%  syscall.pwrite
+         0     0% 55.33%      7.53s 30.75%  syscall.syscall6
+         0     0% 55.33%      7.53s 30.75%  syscall.syscalln
+         0     0% 55.33%      5.38s 21.97%  testing.(*B).run1.func1
+         0     0% 55.33%      5.38s 21.97%  testing.(*B).runN
