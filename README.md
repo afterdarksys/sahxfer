@@ -19,7 +19,7 @@ A finished command writes three lines to stdout: the grant id, the transfer id a
 
 `recv --ctl-fd 3 --event-fd 4` is the mode the host agent spawns, as the host user, after it has verified the lease. It is refused with `--grant`, `--listen`, `--to`, or `--root`. Fd 3 carries one JSON grant line (unknown fields refused, 64 KiB cap), then `renew` and `cancel` lines; EOF on fd 3 is cancel. Fd 4 carries `ready`, `active`, and one final `result` line, never the key or the route token. `recv` stops itself at the lease deadline it was given unless a renew moves it forward. Stdout and stderr keep the contract above. `recv --sweep --ctl-fd 3` reads `{root, path, grant_id}` and removes only that grant's `.sahxfer-<grant_id>.part`. `PROTOCOL.md` §1.1 has the lines.
 
-`--diag` on `put`, `get`, and `recv` adds `diag ` lines on stderr: the granted socket buffers when the socket opens (`diag rcvbuf=<n> sndbuf=<n>`), and one `diag warn` line if the receive buffer is smaller than the arrival rate times `max(RTprop, 5 ms)`. Without it stderr is only the code.
+`--diag` on `put`, `get`, and `recv` adds `diag ` lines on stderr: the granted socket buffers when the socket opens (`diag rcvbuf=<n> sndbuf=<n>`), one `diag warn` line if the receive buffer is smaller than the arrival rate times `max(RTprop, 5 ms)`, and at most one `diag pace` line per second on the UDP sender with state, bandwidth estimate, flight bytes, window cap, delivered prefix, and smoothed RTT. Without it stderr is only the code.
 
 Socket buffers. Each end asks for 8 MiB of `SO_RCVBUF` and `SO_SNDBUF`. Linux caps that at `net.core.rmem_max` / `net.core.wmem_max` (often 208 KiB), and the helper runs as the host user, so it cannot force more. On a Linux host, as root:
 
@@ -29,6 +29,8 @@ sysctl --system
 ```
 
 sahxfer never sets a sysctl. `docs/design.md` §7.4 has the reasoning. On Linux the data path batches with `recvmmsg` and `sendmmsg`.
+
+The portable path uses bounded 256 KiB source read-ahead, reusable authenticated-decryption scratch space, and direct streaming hashing of successfully written in-order DATA. Out-of-order ranges remain in the temp file. Repairs reread the source; final hash verification, fsync, and rename remain mandatory. See [performance measurements and remaining work](docs/performance.md) for reproducible single-file benchmarks and their limits.
 
 `--url` accepts `https://`, or `http://` only to a loopback IP literal such as `http://127.0.0.1:3103`. `localhost` is refused.
 
