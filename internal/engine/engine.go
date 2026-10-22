@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -92,7 +93,8 @@ type Hooks struct {
 	Cleanup func()
 }
 
-// File is the receiver's temp file. The hash reads back what was written.
+// File is the receiver's temp file. Out-of-order data and ZERO ranges are
+// read back for hashing; newly written contiguous DATA is hashed directly.
 type File interface {
 	io.ReaderAt
 	io.WriterAt
@@ -206,9 +208,12 @@ type Peer struct {
 
 	// rxWire is the bytes of authentic datagrams received; minRTT is the
 	// least RTT sample. RecvRate reports them for the socket-buffer check.
-	rxWire  uint64
-	minRTT  time.Duration
-	scanBuf []byte
+	rxWire    uint64
+	minRTT    time.Duration
+	scanBuf   []byte
+	sourceBuf []byte
+	sourceAt  uint64
+	openBuf   []byte
 }
 
 // pendFrame is one classified frame: DATA with its bytes, or a ZERO span.
@@ -356,7 +361,8 @@ func (p *Peer) AttachSource(r io.ReaderAt) error {
 // AttachDest is the receiver's temp file.
 func (p *Peer) AttachDest(f File) { p.dest = f }
 
-// Pump runs one virtual instant. It does not block.
+// Pump runs one virtual instant. It does not sleep, but synchronous file
+// reads, writes, hashing, and commit hooks can take wall-clock time.
 func (p *Peer) Pump(now time.Duration) {
 	p.unpaced = false
 	p.tick(now)
@@ -415,11 +421,7 @@ func (p *Peer) recv(now time.Duration, dgram []byte, pinned bool) bool {
 	var h frame.Header
 	var pt []byte
 	var err error
-	if pinned {
-		h, pt, err = p.sess.Open(dgram, p.cfg.PeerDir)
-	} else {
-		h, pt, err = p.sess.OpenUncounted(dgram, p.cfg.PeerDir)
-	}
+	h, pt, err = p.sess.OpenInto(p.openBuf, dgram, p.cfg.PeerDir, pinned)
 	if errors.Is(err, seal.ErrBudget) {
 		p.abort(now, frame.ReasonAuth)
 		return false
@@ -427,6 +429,7 @@ func (p *Peer) recv(now time.Duration, dgram []byte, pinned bool) bool {
 	if err != nil {
 		return false
 	}
+	p.openBuf = pt[:0]
 	if h.TransferID != p.cfg.TransferID {
 		return false
 	}
@@ -479,10 +482,13 @@ func (p *Peer) WakeAt(now time.Duration) time.Duration {
 	if p.state == stAbort || (p.OK()) {
 		return now + p.cfg.Max
 	}
+	if !p.started {
+		return now
+	}
 	next := now + p.cfg.Max
 	consider := func(t time.Duration) {
-		if t > now && t < next {
-			next = t
+		if t < next {
+			next = max(t, now)
 		}
 	}
 	if p.cfg.Sender && p.wantData() {
@@ -524,16 +530,16 @@ func (p *Peer) WakeAt(now time.Duration) time.Duration {
 		consider(p.lastFIN + p.rtt())
 	}
 	if p.cfg.Sender && p.stalling() && !p.noStall {
-		consider(p.stallStart() + p.stallWait())
-		consider(p.recheckAt)
+		consider(max(p.stallStart()+p.stallWait(), p.recheckAt))
 	}
 	if !p.cfg.Sender {
-		if !p.fbSent {
-			consider(p.start + cc.FeedbackFloor)
-		} else {
+		if p.cfg.Size == 0 || p.holes.Delivered() > 0 {
+			if !p.fbSent || p.dataSinceFB >= 64 {
+				return now
+			}
 			consider(p.lastFB + p.fbEvery())
 		}
-		if p.nackSent {
+		if p.nackSent && len(p.holes.Mature(now, p.srtt)) > 0 {
 			consider(p.lastNACK + p.rtt())
 		}
 		if p.committed && !p.gotClose {
@@ -582,6 +588,11 @@ func (p *Peer) Close() {
 	}
 	p.sess.Wipe()
 	p.sess = nil
+	clear(p.openBuf[:cap(p.openBuf)])
+	clear(p.sourceBuf[:cap(p.sourceBuf)])
+	clear(p.scanBuf[:cap(p.scanBuf)])
+	clear(p.hashBuf[:cap(p.hashBuf)])
+	p.openBuf, p.sourceBuf, p.scanBuf, p.hashBuf = nil, nil, nil, nil
 }
 
 // RecvRate is the receiver's arrival rate in wire bytes per second since
@@ -601,6 +612,15 @@ func (p *Peer) RecvRate(now time.Duration) (float64, time.Duration) {
 // ZeroStats is the ZERO frames this sender sealed for the first time and
 // the file bytes they carried.
 func (p *Peer) ZeroStats() (frames, bytes uint64) { return p.zeroFrames, p.zeroBytes }
+
+// PacingDiagnostic contains only rate/window counters, never file contents
+// or grant material. Empty means this peer has no congestion controller.
+func (p *Peer) PacingDiagnostic() string {
+	if !p.cfg.Sender || p.pacer == nil {
+		return ""
+	}
+	return fmt.Sprintf("diag pace state=%s bw=%.0f inflight=%d cap=%d delivered=%d srtt=%s", p.pacer.State(), p.pacer.BW(), p.pacer.Inflight(), p.pacer.Cap(), p.contig, p.srtt)
+}
 
 // Delivered is unique file bytes accepted (receiver) or acknowledged (sender).
 func (p *Peer) Delivered() uint64 {
@@ -868,7 +888,7 @@ func (p *Peer) classify(sp frame.Span, retx bool) (pendFrame, error) {
 		end = sp.Start + mss
 	}
 	buf := make([]byte, end-sp.Start)
-	if _, err := p.src.ReadAt(buf, int64(sp.Start)); err != nil {
+	if err := p.readSource(buf, sp.Start, retx); err != nil {
 		return pendFrame{}, err
 	}
 	data := pendFrame{sp: frame.Span{Start: sp.Start, End: end}, buf: buf}
@@ -896,6 +916,37 @@ func (p *Peer) classify(sp frame.Span, retx bool) (pendFrame, error) {
 	return data, nil
 }
 
+// readSource amortizes sequential file syscalls, without lending scratch
+// storage to a pending frame. Repairs always reread the current source.
+func (p *Peer) readSource(dst []byte, off uint64, repair bool) error {
+	if repair {
+		return readFullAt(p.src, dst, int64(off))
+	}
+	end := off + uint64(len(dst))
+	if off < p.sourceAt || end > p.sourceAt+uint64(len(p.sourceBuf)) {
+		n := min(uint64(256<<10), p.cfg.Size-off)
+		if cap(p.sourceBuf) < int(n) {
+			p.sourceBuf = make([]byte, n)
+		} else {
+			p.sourceBuf = p.sourceBuf[:n]
+		}
+		if err := readFullAt(p.src, p.sourceBuf, int64(off)); err != nil {
+			return err
+		}
+		p.sourceAt = off
+	}
+	copy(dst, p.sourceBuf[off-p.sourceAt:end-p.sourceAt])
+	return nil
+}
+
+func readFullAt(r io.ReaderAt, dst []byte, off int64) error {
+	n, err := r.ReadAt(dst, off)
+	if n != len(dst) && err == nil {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
 // zeroRun reads from at, in blocks of MSS (the last may end at limit),
 // and returns the end of the leading all-zero blocks.
 func (p *Peer) zeroRun(at, limit uint64) (uint64, error) {
@@ -913,7 +964,7 @@ func (p *Peer) zeroRun(at, limit uint64) (uint64, error) {
 			n = chunk
 		}
 		b := p.scanBuf[:n]
-		if _, err := p.src.ReadAt(b, int64(at)); err != nil {
+		if err := readFullAt(p.src, b, int64(at)); err != nil {
 			return 0, err
 		}
 		for len(b) > 0 {
@@ -1235,8 +1286,23 @@ func (p *Peer) onData(now time.Duration, h frame.Header, pt []byte) {
 		return
 	}
 	p.accept(now, h, end, func(lo, hi uint64) error {
-		_, err := p.dest.WriteAt(pt[lo-h.Offset:hi-h.Offset], int64(lo))
-		return err
+		b := pt[lo-h.Offset : hi-h.Offset]
+		n, err := p.dest.WriteAt(b, int64(lo))
+		if err != nil {
+			return err
+		}
+		if n != len(b) {
+			return io.ErrShortWrite
+		}
+		// Only the missing portion at the hash frontier is new, contiguous
+		// plaintext. Earlier accepted overlapping bytes must win.
+		if lo == p.hashedTo {
+			if _, err := p.hash.Write(b); err != nil {
+				return err
+			}
+			p.hashedTo = hi
+		}
+		return nil
 	})
 }
 
@@ -1272,7 +1338,10 @@ func (p *Peer) zeroFill(lo, hi uint64) error {
 	case *os.File:
 		return safeio.ZeroRange(d, int64(lo), int64(hi-lo))
 	default:
-		_, err := p.dest.WriteAt([]byte{0}, int64(hi-1))
+		n, err := p.dest.WriteAt([]byte{0}, int64(hi-1))
+		if err == nil && n != 1 {
+			return io.ErrShortWrite
+		}
 		return err
 	}
 }
@@ -1284,22 +1353,9 @@ func (p *Peer) accept(now time.Duration, h frame.Header, end uint64, put func(lo
 		p.abort(now, frame.ReasonIO)
 		return
 	}
-	for _, miss := range p.holes.Missing() {
-		if miss.End <= h.Offset || miss.Start >= end {
-			continue
-		}
-		lo := miss.Start
-		if h.Offset > lo {
-			lo = h.Offset
-		}
-		hi := miss.End
-		if end < hi {
-			hi = end
-		}
-		if err := put(lo, hi); err != nil {
-			p.abort(now, frame.ReasonIO)
-			return
-		}
+	if err := p.holes.VisitMissing(h.Offset, end, put); err != nil {
+		p.abort(now, frame.ReasonIO)
+		return
 	}
 	newly, err := p.holes.Accept(h.Offset, end, h.Seq, now)
 	if err != nil {
@@ -1351,7 +1407,7 @@ func (p *Peer) foldHash(now time.Duration, max uint64) {
 			p.hashBuf = make([]byte, n)
 		}
 		buf := p.hashBuf[:n]
-		if _, err := p.dest.ReadAt(buf, int64(p.hashedTo)); err != nil {
+		if err := readFullAt(p.dest, buf, int64(p.hashedTo)); err != nil {
 			p.abort(now, frame.ReasonIO)
 			return
 		}

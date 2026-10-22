@@ -144,7 +144,14 @@ func (s *Session) Seal(h frame.Header, pt []byte, dir byte) ([]byte, error) {
 // peerDir is who the peer is (the side that sent this packet). It is not
 // read from the datagram.
 func (s *Session) Open(dgram []byte, peerDir byte) (frame.Header, []byte, error) {
-	return s.open(dgram, peerDir, true)
+	return s.open(nil, dgram, peerDir, true)
+}
+
+// OpenInto opens into caller-owned scratch space. dst must not overlap
+// dgram. On failure no plaintext is returned; the scratch contents are
+// unspecified. Successful plaintext is valid until the caller reuses dst.
+func (s *Session) OpenInto(dst, dgram []byte, peerDir byte, counted bool) (frame.Header, []byte, error) {
+	return s.open(dst[:0], dgram, peerDir, counted)
 }
 
 // OpenUncounted is Open for a datagram from a source that is not yet
@@ -152,10 +159,10 @@ func (s *Session) Open(dgram []byte, peerDir byte) (frame.Header, []byte, error)
 // so datagrams from anyone who can reach an open listen port cannot use up
 // the 32 failures before the real peer arrives.
 func (s *Session) OpenUncounted(dgram []byte, peerDir byte) (frame.Header, []byte, error) {
-	return s.open(dgram, peerDir, false)
+	return s.open(nil, dgram, peerDir, false)
 }
 
-func (s *Session) open(dgram []byte, peerDir byte, count bool) (frame.Header, []byte, error) {
+func (s *Session) open(dst, dgram []byte, peerDir byte, count bool) (frame.Header, []byte, error) {
 	if s == nil || s.wiped || s.aead == nil {
 		return frame.Header{}, nil, ErrBudget
 	}
@@ -172,7 +179,7 @@ func (s *Session) open(dgram []byte, peerDir byte, count bool) (frame.Header, []
 	if !TokenEqual(h.RouteToken[:], s.token[:]) {
 		return frame.Header{}, nil, s.failIf(count, true)
 	}
-	pt, err := s.aead.Open(nil, nonce(peerDir, h.Seq), dgram[frame.HeaderSize:], dgram[:frame.HeaderSize])
+	pt, err := s.aead.Open(dst, nonce(peerDir, h.Seq), dgram[frame.HeaderSize:], dgram[:frame.HeaderSize])
 	if err != nil {
 		return frame.Header{}, nil, s.failIf(count, false)
 	}

@@ -5,6 +5,51 @@ import (
 	"time"
 )
 
+func TestDelayedFeedbackAllowsStartupGrowth(t *testing.T) {
+	p := New(1152)
+	p.OnRTT(time.Millisecond, 0)
+	p.Sample(10*1152, 20*time.Millisecond)
+	p.Sample(20*1152, 40*time.Millisecond)
+	if p.Cap() < 20*1152 {
+		t.Fatalf("window trapped by delayed feedback: %d", p.Cap())
+	}
+	// Replays and no-progress reports cannot refresh aggregation credit.
+	n := p.feedbackN
+	p.Sample(20*1152, time.Second)
+	p.Sample(1, 2*time.Second)
+	if p.feedbackN != n {
+		t.Fatal("stale delivery changed aggregation")
+	}
+	p.Sample(30*1152, 3*time.Second)
+	for _, gap := range p.feedbackGaps {
+		if gap > 50*time.Millisecond {
+			t.Fatal("unbounded outage allowance")
+		}
+	}
+	// Steady fast feedback expires the old aggregation window.
+	for i := 1; i <= bwRounds; i++ {
+		p.Sample(uint64(30+i)*1152, 3*time.Second+time.Duration(i)*time.Millisecond)
+	}
+	for _, gap := range p.feedbackGaps {
+		if gap > time.Millisecond {
+			t.Fatal("aggregation never aged out")
+		}
+	}
+}
+
+func TestFirstSendHasNoAccumulatedCredit(t *testing.T) {
+	for _, now := range []time.Duration{0, time.Millisecond, 2 * time.Millisecond, time.Hour} {
+		p := New(1152)
+		if !p.CanSend(now, 1152) {
+			t.Fatal("first send blocked")
+		}
+		p.OnSend(1152, now)
+		if p.CanSend(now, 1152) {
+			t.Fatalf("first send at %v inherited credit", now)
+		}
+	}
+}
+
 func TestInitialWindowAndPace(t *testing.T) {
 	p := New(1000)
 	if p.State() != Startup || p.Gain() != startupGain {
@@ -342,21 +387,23 @@ func pacedAt10MB() (*Pacer, time.Duration) {
 // A runner that wakes 200 us late on every send still sends at the pacing
 // rate: the next slot is scheduled from the previous slot.
 func TestPacingAbsorbsLateWakeups(t *testing.T) {
-	p, start := pacedAt10MB()
-	now := start
-	sent := 0
-	for now < start+100*time.Millisecond {
-		if p.CanSend(now, 1000) {
-			p.OnSend(1000, now)
-			p.OnFilled(1000, now)
-			sent++
-			continue
+	for _, late := range []time.Duration{200 * time.Microsecond, 1100 * time.Microsecond} {
+		p, start := pacedAt10MB()
+		now := start
+		sent := 0
+		for now < start+100*time.Millisecond {
+			if p.CanSend(now, 1000) {
+				p.OnSend(1000, now)
+				p.OnFilled(1000, now)
+				sent++
+				continue
+			}
+			now = p.WakeAt(now) + late
 		}
-		now = p.WakeAt(now) + 200*time.Microsecond
-	}
-	rate := float64(sent*1000) / 0.1
-	if want := 10e6; rate < 0.9*want {
-		t.Fatalf("sent %.0f B/s, pacing rate about %.0f B/s", rate, want)
+		rate := float64(sent*1000) / 0.1
+		if want := 10e6; rate < 0.9*want {
+			t.Fatalf("sent %.0f B/s, pacing rate about %.0f B/s", rate, want)
+		}
 	}
 }
 
@@ -381,20 +428,20 @@ func burstAt(t *testing.T, late time.Duration) (int, time.Duration) {
 	return n, iv
 }
 
-// 0.9 ms late: catch up at most about 1 ms of data plus one segment.
+// 1.9 ms late: catch up at most about 2 ms of data plus one segment.
 func TestPacingLateBurstLimit(t *testing.T) {
-	n, iv := burstAt(t, 900*time.Microsecond)
-	most := int(time.Millisecond/iv) + 1
-	least := int(900 * time.Microsecond / iv)
+	n, iv := burstAt(t, 1900*time.Microsecond)
+	most := int(paceSlack/iv) + 1
+	least := int(1900 * time.Microsecond / iv)
 	if n > most || n < least {
-		t.Fatalf("0.9 ms late sent %d segments, want %d..%d (slot %v)", n, least, most, iv)
+		t.Fatalf("1.9 ms late sent %d segments, want %d..%d (slot %v)", n, least, most, iv)
 	}
 }
 
-// More than 1 ms behind means idle: one segment, then a paced gap.
+// More than 2 ms behind means idle: one segment, then a paced gap.
 func TestPacingNoCreditAfterIdle(t *testing.T) {
-	if n, _ := burstAt(t, 1500*time.Microsecond); n != 1 {
-		t.Fatalf("1.5 ms late sent %d segments, want 1", n)
+	if n, _ := burstAt(t, 2500*time.Microsecond); n != 1 {
+		t.Fatalf("2.5 ms late sent %d segments, want 1", n)
 	}
 	p, t0 := pacedAt10MB()
 	p.OnSend(1000, t0)

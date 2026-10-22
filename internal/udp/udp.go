@@ -35,6 +35,8 @@ import (
 // data receiver checks once a second whether the usable part of it is
 // below its arrival rate times max(RTprop, 5 ms) and calls Diag with one
 // "diag warn" line the first time it is (docs/design.md section 7.4).
+// With Diag set, a UDP sender also reports its pacing counters at most
+// once a second. These lines never contain grant material or file bytes.
 type Config struct {
 	Peer      *engine.Peer
 	Conn      *net.UDPConn
@@ -77,6 +79,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var progSent uint64
 	var warned bool
 	var lastCheck time.Time
+	var lastPace time.Time
 	cancel := func() error {
 		cfg.Peer.Cancel(clock(cfg.Epoch))
 		out := cfg.Peer.Take()
@@ -178,6 +181,12 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		now = clock(cfg.Epoch)
 		cfg.Peer.Pump(now)
+		if cfg.Diag != nil && authentic && time.Since(lastPace) >= time.Second {
+			if line := cfg.Peer.PacingDiagnostic(); line != "" {
+				cfg.Diag(line)
+			}
+			lastPace = time.Now()
+		}
 		out := cfg.Peer.Take()
 		note(out)
 		if !cfg.Connected && remote == nil {

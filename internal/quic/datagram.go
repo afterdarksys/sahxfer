@@ -145,13 +145,12 @@ func RunDatagram(ctx context.Context, d Datagram) error {
 		} else {
 			wait := 50 * time.Millisecond
 			wake := d.Peer.WakeAt(now)
-			if wake > now {
+			if wake <= now && inflight == 0 && len(pending) == 0 {
+				wait = 0
+			} else if wake > now {
 				if delta := wake - now; delta < wait {
 					wait = delta
 				}
-			}
-			if wait <= 0 {
-				wait = 50 * time.Millisecond
 			}
 			timer.Reset(wait)
 			timerC = timer.C

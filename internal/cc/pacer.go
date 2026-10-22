@@ -29,7 +29,7 @@ const (
 	// a high rate but not a full pipe.
 	startupLossSegs = 6
 	// paceSlack is the most lateness the pacer catches up.
-	paceSlack = time.Millisecond
+	paceSlack = 2 * time.Millisecond
 )
 
 // FeedbackFloor is the receiver's FEEDBACK cadence floor (PROTOCOL 4.2).
@@ -72,36 +72,41 @@ type Pacer struct {
 	cap      uint64
 	inflight uint64
 
-	bw          float64 // bw_max: max of bwWin
-	bwWin       [bwRounds]float64
-	bwN         int
-	latest      float64
-	bwLo        float64 // 0 when unset
-	inflightLo  uint64  // 0 when unset
-	roundSet    bool
-	prevRoundBW float64
-	stagnant    int
-	minRTT      time.Duration
-	minRTTAt    time.Duration
-	haveRTT     bool
-	roundStart  time.Duration
-	round       uint64
-	roundDeliv  uint64
-	delivered   uint64
-	roundLost   uint64
-	lossWin     [lossRounds][2]uint64 // lost, delivered per round
-	lossN       int
-	appLimited  bool
-	nextSend    time.Duration
-	phase       int
-	phaseStart  time.Duration
-	probeUntil  time.Duration
-	probeMin    time.Duration // least RTT sample during PROBE_RTT
-	srtt        time.Duration // EWMA of OnRTT samples, gain 1/8
-	startupCut  uint64        // the cut that ended STARTUP, 0 if none
-	ce          uint64
-	cuts        uint64
-	lostTotal   uint64
+	bw           float64 // bw_max: max of bwWin
+	bwWin        [bwRounds]float64
+	bwN          int
+	latest       float64
+	bwLo         float64 // 0 when unset
+	inflightLo   uint64  // 0 when unset
+	roundSet     bool
+	prevRoundBW  float64
+	stagnant     int
+	minRTT       time.Duration
+	minRTTAt     time.Duration
+	haveRTT      bool
+	roundStart   time.Duration
+	round        uint64
+	roundDeliv   uint64
+	delivered    uint64
+	roundLost    uint64
+	lossWin      [lossRounds][2]uint64 // lost, delivered per round
+	lossN        int
+	appLimited   bool
+	nextSend     time.Duration
+	haveSent     bool
+	phase        int
+	phaseStart   time.Duration
+	probeUntil   time.Duration
+	probeMin     time.Duration // least RTT sample during PROBE_RTT
+	srtt         time.Duration // EWMA of OnRTT samples, gain 1/8
+	startupCut   uint64        // the cut that ended STARTUP, 0 if none
+	ce           uint64
+	cuts         uint64
+	lostTotal    uint64
+	feedbackAt   time.Duration
+	haveFeedback bool
+	feedbackGaps [bwRounds]time.Duration
+	feedbackN    int
 }
 
 // New returns a pacer in startup. mss is the plaintext cap, at least 1.
@@ -223,9 +228,10 @@ func (p *Pacer) OnSend(n uint64, now time.Duration) {
 	// does not lower the rate. A slot more than paceSlack behind means the
 	// sender was idle, not late: no credit, schedule from now.
 	base := p.nextSend
-	if base < now-paceSlack {
+	if !p.haveSent || base < now-paceSlack {
 		base = now
 	}
+	p.haveSent = true
 	p.nextSend = base + p.interval(n)
 }
 
@@ -245,6 +251,12 @@ func (p *Pacer) OnFilled(n uint64, now time.Duration) {
 // FEEDBACK arrivals delimit rounds (docs/design.md section 6).
 func (p *Pacer) Sample(delivered uint64, now time.Duration) {
 	if delivered > p.delivered {
+		if p.haveFeedback && now > p.feedbackAt {
+			p.feedbackGaps[p.feedbackN%bwRounds] = min(now-p.feedbackAt, 50*time.Millisecond)
+			p.feedbackN++
+		}
+		p.feedbackAt = now
+		p.haveFeedback = true
 		p.delivered = delivered
 	}
 	p.advanceRound(now)
@@ -491,11 +503,14 @@ func (p *Pacer) bdp() uint64 {
 	return uint64(p.bw * p.minRTT.Seconds())
 }
 
-// targetCap is max(2 * bw * L, 10*MSS), then at most inflight_lo: one
-// RTprop plus one FEEDBACK interval of data at the estimated rate, with
-// BBR's window gain (docs/design.md section 6).
+// targetCap covers the base round and bounded observed ACK aggregation.
+// The allowance changes flight credit, never the pacing rate or loss cap.
 func (p *Pacer) targetCap() uint64 {
-	c := uint64(cwndGain * p.estBW() * p.roundLen().Seconds())
+	horizon := p.roundLen()
+	for _, gap := range p.feedbackGaps {
+		horizon = max(horizon, gap)
+	}
+	c := uint64(cwndGain * p.estBW() * horizon.Seconds())
 	if floor := 10 * p.mss; c < floor {
 		c = floor
 	}

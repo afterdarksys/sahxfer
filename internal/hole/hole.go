@@ -57,6 +57,22 @@ func (m *Map) Accept(start, end uint64, seq uint64, now time.Duration) (uint64, 
 	if start >= end || end > m.size {
 		return 0, ErrRange
 	}
+	// The usual in-order path keeps one trailing hole. Avoid allocating
+	// and rebuilding the interval slice for every packet on that path.
+	if len(m.missing) == 1 && start <= m.missing[0].start && end > m.missing[0].start && end <= m.missing[0].end {
+		h := &m.missing[0]
+		n := end - h.start
+		if end == h.end {
+			m.missing = m.missing[:0]
+		} else {
+			*h = span{start: end, end: h.end, born: now, birthSeq: seq}
+		}
+		m.delivered += n
+		if end > m.maxEnd {
+			m.maxEnd = end
+		}
+		return n, nil
+	}
 	var wrote uint64
 	next := make([]span, 0, len(m.missing)+1)
 	for _, h := range m.missing {
@@ -174,4 +190,21 @@ func (m *Map) Missing() []frame.Span {
 		out[i] = frame.Span{Start: h.start, End: h.end}
 	}
 	return out
+}
+
+// VisitMissing visits only missing portions of [start,end), without
+// allocating a copy of the map. The callback must not mutate the map.
+func (m *Map) VisitMissing(start, end uint64, visit func(lo, hi uint64) error) error {
+	for _, h := range m.missing {
+		if h.start >= end {
+			break
+		}
+		if h.end <= start {
+			continue
+		}
+		if err := visit(max(start, h.start), min(end, h.end)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

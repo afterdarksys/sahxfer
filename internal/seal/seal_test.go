@@ -50,6 +50,35 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOpenIntoReuseAndFailure(t *testing.T) {
+	s := testSession(t)
+	defer s.Wipe()
+	scratch := make([]byte, 0, 2048)
+	for seq := uint64(1); seq <= 3; seq++ {
+		plain := bytes.Repeat([]byte{byte(seq)}, int(seq)*100)
+		d, err := s.Seal(dataHeader(seq), plain, DirClient)
+		if err != nil {
+			t.Fatal(err)
+		}
+		original := append([]byte(nil), d...)
+		_, pt, err := s.OpenInto(scratch, d, DirClient, true)
+		if err != nil || !bytes.Equal(pt, plain) {
+			t.Fatalf("open: %v", err)
+		}
+		if &pt[0] != &scratch[:cap(scratch)][0] {
+			t.Fatal("scratch not reused")
+		}
+		if !bytes.Equal(d, original) {
+			t.Fatal("ciphertext mutated")
+		}
+		d[len(d)-1] ^= 1
+		_, pt, err = s.OpenInto(scratch, d, DirClient, true)
+		if err != ErrDrop || pt != nil {
+			t.Fatal("tampered tag exposed plaintext")
+		}
+	}
+}
+
 func TestRejectsBeforeAEAD(t *testing.T) {
 	s := testSession(t)
 	d, err := s.Seal(dataHeader(1), []byte("abc"), DirClient)

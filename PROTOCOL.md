@@ -145,6 +145,10 @@ u64 recv_rate_bps
 
 pace-bbr uses this sample. It runs on UDP. `quic-datagram` and `quic-bridge` turn inner pacing off, because QUIC already paces that hop.
 
+The implementation's flight window includes a bounded aggregation allowance: the maximum of the last ten delivery-advancing feedback intervals, each capped at 50 ms. It uses `max(2 * bw * max(RTprop, 5 ms, allowance), 10 * MSS)`, subject to the loss cap and the four-MSS PROBE_RTT override. Packet pacing catches up at most 2 ms of lateness; a longer idle gap resets credit. The allowance changes the window, not the paced bandwidth estimate. See `docs/design.md` §6 for the complete controller.
+
+A due feedback, close, recovery, or expiry timer must be serviced without an additional socket wait. Only actionable timers schedule an immediate pump: no feedback timer before any DATA of a nonempty file, and no repeated NACK timer after its holes have filled. Scheduler delays are not a reason to postpone an already due timer by another polling interval. This is a local scheduling requirement, not a wire-format change.
+
 ### 4.3 Close
 
 `FIN` and `DONE` are the close signals. They are not per-packet acknowledgements.
@@ -205,6 +209,10 @@ The sender keeps the file. A retransmission reads the range again, seals it unde
 The receiver writes the temp file with `pwrite`. A `ZERO` span is written as a hole: the temp file is extended with `ftruncate` when it is shorter than the span's end (never shrunk), then the block-aligned inside of the span is deallocated with `fallocate(PUNCH_HOLE|KEEP_SIZE)` on Linux or `F_PUNCHHOLE` on Darwin where the filesystem supports it, and nothing more elsewhere. The temp was created empty and a range the hole map lacks was never written, so it reads as zero once the file covers it. The first write at an offset wins. A replay of the same bytes is a no-op. The streaming SHA-256 folds only the contiguous prefix. Out-of-order ranges sit in the file until the gap in front of them closes.
 
 The hole map starts as `[0, size)`. It holds missing ranges, not file bytes.
+
+Implementations may hash newly written contiguous DATA directly from authenticated plaintext after a complete successful write. Only previously missing bytes at the hash frontier may enter that hash; duplicate or overlapping bytes already on disk must never be replaced or hashed from the new packet. Out-of-order bytes and ZERO ranges are read from the temp file as the hash frontier reaches them. Short I/O fails closed with `io`. Streaming hashing verifies accepted contents; post-fsync media verification is a separate policy described in the design.
+
+Bounded read-ahead and reusable decryption scratch space are local implementation choices. A pending sender frame owns its plaintext independently of scratch buffers. A repair rereads the source and uses a fresh sequence. A failed authenticated open must never expose scratch contents to the file writer. These optimizations leave the grant, nonce, cipher, byte caps, and v1 framing unchanged.
 
 `byte_cap` counts unique file bytes sealed for the first time and unique bytes accepted, a `ZERO` by its `length`. A retransmission does not add to the cap. Exceeding the cap aborts with `byte_cap`. The relay charges a `ZERO` its 88 bytes against its control budget (§6).
 

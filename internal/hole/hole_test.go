@@ -1,11 +1,58 @@
 package hole
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/afterdarksys/sahxfer/internal/frame"
 )
+
+func TestMissingVisitorAndAcceptMatchBitmap(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	for trial := 0; trial < 50; trial++ {
+		m, _ := New(256)
+		var present [256]bool
+		var delivered uint64
+		for seq := uint64(1); seq <= 100; seq++ {
+			start := rng.Intn(256)
+			end := start + 1 + rng.Intn(256-start)
+			var want uint64
+			for i := start; i < end; i++ {
+				if !present[i] {
+					want++
+				}
+			}
+			var visited uint64
+			if err := m.VisitMissing(uint64(start), uint64(end), func(lo, hi uint64) error {
+				for i := lo; i < hi; i++ {
+					if present[i] {
+						t.Fatal("visited filled byte")
+					}
+					visited++
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			n, err := m.Accept(uint64(start), uint64(end), seq, time.Duration(seq)*time.Millisecond)
+			if err != nil || n != want || visited != want {
+				t.Fatalf("accept=%d visit=%d want=%d err=%v", n, visited, want, err)
+			}
+			for i := start; i < end; i++ {
+				present[i] = true
+			}
+			delivered += want
+			var prefix uint64
+			for prefix < 256 && present[prefix] {
+				prefix++
+			}
+			if m.Delivered() != delivered || m.Contiguous() != prefix {
+				t.Fatal("bitmap mismatch")
+			}
+		}
+	}
+}
 
 func TestEmptyFile(t *testing.T) {
 	m, err := New(0)

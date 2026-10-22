@@ -103,7 +103,7 @@ func newEnds(t *testing.T, file []byte, cap uint64) *ends {
 	return e
 }
 
-func listen(t *testing.T) *net.UDPConn {
+func listen(t testing.TB) *net.UDPConn {
 	t.Helper()
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
@@ -112,7 +112,7 @@ func listen(t *testing.T) *net.UDPConn {
 	return c
 }
 
-func dial(t *testing.T, addr net.Addr) *net.UDPConn {
+func dial(t testing.TB, addr net.Addr) *net.UDPConn {
 	t.Helper()
 	c, err := net.DialUDP("udp", nil, addr.(*net.UDPAddr))
 	if err != nil {
@@ -312,7 +312,7 @@ func loopbackThroughput(t *testing.T, size int, late, bound time.Duration) {
 	go func() { errc <- Run(ctx, Config{Peer: e.r, Conn: lc}) }()
 	time.Sleep(late)
 	began := time.Now()
-	txErr := Run(ctx, Config{Peer: e.s, Conn: dc, Connected: true})
+	txErr := Run(ctx, Config{Peer: e.s, Conn: dc, Connected: true, Diag: func(line string) { t.Log(line) }})
 	rxErr := <-errc
 	took := time.Since(began)
 	if txErr != nil || rxErr != nil {
