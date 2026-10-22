@@ -28,6 +28,17 @@ using at most 512 KiB of source buffers. It is off by default, works with both
 writes or eliminate source hash preparation. See [measurements](docs/performance.md)
 and [the I/O specification](docs/design.md#73-where-this-runs).
 
+UDP reuses returned ciphertext buffers through a per-peer cache capped at 64
+datagrams (512 KiB). Buffers return only after socket writes finish or fail and
+are wiped before reuse. Nonce scratch and binary peer-address comparison avoid
+per-packet temporary allocations; the complete transfer is not allocation-free.
+
+The [platform roadmap](docs/platform-roadmap.md) records the next-generation
+direction: durable processed-event streams first, then fresh-update analytics
+and bulk AI datasets/checkpoints. The [durable-stream contract](docs/durable-streams.md)
+is a proposal, not a shipped streaming service. Audit exports, retention controls,
+deployment compliance profiles, and commercial release gates are planned there.
+
 Socket buffers. Each end asks for 8 MiB of `SO_RCVBUF` and `SO_SNDBUF`. Linux caps that at `net.core.rmem_max` / `net.core.wmem_max` (often 208 KiB), and the helper runs as the host user, so it cannot force more. On a Linux host, as root:
 
 ```

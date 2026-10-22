@@ -9,6 +9,12 @@ processing using two bounded buffers. It requires no peer negotiation and
 changes no grant, frame, digest, pacing, or completion rules. It is off by default;
 receiver writes and verification remain synchronous.
 
+UDP's local returned-buffer cache and reusable nonce scratch do not change the
+wire format or delivery semantics. Packet sequence remains direction-specific
+and never reused under a key. Streaming processed events requires a separate
+grant and protocol contract; `docs/durable-streams.md` is a proposal and does
+not authorize using v1 file grants for live streams.
+
 ## 1. Grant
 
 The client sends one credential in a header. `Authorization: Bearer` carries the sahconnect device-login token, and only when that token is bound to the request origin. `X-API-Key` is the other credential. The two are not sent together. Credentials never appear in a query string or in a UDP field.
